@@ -1,0 +1,28 @@
+[package]
+name = "rpf"
+version = "0.1.0"
+edition = "2021"
+description = "RPF — a fast, secure RPM package manager for Fedora, written entirely in Rust"
+license = "Apache-2.0 OR MIT"
+rust-version = "1.75"
+repository = "https://github.com/Nielsniz-SVG/RPF-Package-Manager"
+readme = "README.md"
+
+[lib]
+name = "rpf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rpf"
+path = "src/main.rs"
+
+# No dependencies by design: RPF is std-only so it builds anywhere a Rust
+# toolchain exists, with no supply-chain surface beyond the standard library.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
