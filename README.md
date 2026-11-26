@@ -99,16 +99,55 @@ is refused rather than installed unverified. Key expiry, revocation and web of
 trust are not evaluated: a key present in the configured keyring is trusted,
 the same model `rpm --import` uses.
 
-## Build
+## Build and install
 
 ```sh
-cargo build --release      # -> target/release/rpf
-cargo test                 # 175 tests: unit, end-to-end, installation
+cargo build --release                # -> target/release/rpf
+cargo test                           # 175 tests: unit, end-to-end, installation
+
+# put it on $PATH (either way)
+sudo install -Dm755 target/release/rpf /usr/local/bin/rpf
+cargo install --path .               # or -> ~/.cargo/bin/rpf
 ```
 
-Requirements: a Rust toolchain (1.70+). At runtime on Fedora, RPF uses `curl`
+Requirements: a Rust toolchain (1.75+). At runtime on Fedora, RPF uses `curl`
 for downloads and `gzip`/`xz`/`zstd` to decompress metadata — all present on a
 stock Fedora system.
+
+First run, as root (it writes `/var/cache/rpf`):
+
+```sh
+sudo rpf repolist                    # shows the built-in Fedora/RPM Fusion set
+sudo rpf makecache                   # fetch + verify repository metadata
+```
+
+Nothing has to be installed to try it. Queries work without root if the cache
+is pointed somewhere writable, and transactions can go into a scratch root so
+the host is never touched:
+
+```sh
+export RPF_CACHEDIR=$HOME/.cache/rpf
+rpf repolist && rpf makecache
+rpf search htop
+
+sudo rpf --installroot /tmp/testroot install htop   # sandboxed install
+sudo rpf --installroot /tmp/testroot remove htop
+rm -rf /tmp/testroot                                # throw the sandbox away
+
+rpf install --test htop                             # plan only, no writes
+```
+
+## Uninstall
+
+```sh
+sudo rpf remove <packages...>        # uninstall what RPF installed
+sudo rm -f /usr/local/bin/rpf        # or: cargo uninstall rpf
+sudo rm -rf /var/cache/rpf /var/lib/rpf
+# remove any repository files you added, e.g. /etc/rpf/repos.d/*.repo
+```
+
+RPF keeps its own database (`/var/lib/rpf/installed.rpf`) and never writes
+rpm's, so removing it leaves the host rpmdb exactly as it was.
 
 ## Usage
 
