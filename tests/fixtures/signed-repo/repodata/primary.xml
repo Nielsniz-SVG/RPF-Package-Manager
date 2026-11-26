@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
+<package type="rpm">
+  <name>hello</name><arch>x86_64</arch>
+  <version epoch="0" ver="2.0" rel="1"/>
+  <checksum type="sha256" pkgid="YES">d32735351a8952afc9e4afd7309e3a1929288eff5af32526934314f1f304ff7f</checksum>
+  <summary>A signed package used to test RPF</summary><description>A signed package used to test RPF</description>
+  <packager>rpm</packager><url>https://example.org</url>
+  <time file="1700000000" build="1700000000"/>
+  <size package="9915" installed="9915" archive="9915"/>
+  <location href="Packages/hello-2.0-1.x86_64.rpm"/>
+  <format>
+    <rpm:license>MIT</rpm:license><rpm:vendor>rpm</rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:header-range start="1000" end="2000"/>
+    <rpm:provides><rpm:entry name="hello" flags="EQ" epoch="0" ver="2.0" rel="1"/></rpm:provides>
+    <rpm:requires/>
+  </format>
+</package>
+</metadata>

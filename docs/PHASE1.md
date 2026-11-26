@@ -90,6 +90,31 @@ dependency that does not name one ("`foo >= 1.0`" matches `1.0-99.fc43`).
 * The installed database records each package's dependency data, so those
   safety checks still work in later invocations.
 
+### Signature verification
+* ASCII-armour decoder (headers, base64, CRC line skipped on purpose), OpenPGP
+  packet parser for old and new formats, v4 public keys and v4 detached
+  signatures.
+* SHA-256, SHA-384 and SHA-512 implemented in this repository, plus SHA-1 for
+  key fingerprints only — a SHA-1 *signature* is refused, never trusted.
+* RSA verification with hand-written arbitrary-precision arithmetic: CIOS
+  Montgomery multiplication and square-and-multiply, with the wide-intermediate
+  handling an RSA modulus with its top bit set requires.
+* The v4 signature trailer is hashed as `0x04 0xff || BE32(6 + hashed_len)` —
+  the count covers the signature packet's own hashed data, not the document.
+  This was established against packages signed by rpm itself
+  (`tests/fixtures/rpmsig-hello-rsa.rpm`) and by an independent OpenPGP
+  implementation, not guessed.
+* Which bytes a signature covers depends on the tag, exactly as rpm does it:
+  `RPMSIGTAG_RSA`/`DSA` (267/268) sign the main header blob, the legacy
+  `PGP`/`GPG` tags (1002/1005) sign header plus payload.
+* Keys come from `gpgkey=` in repositories (fetched once, cached under
+  `cachedir/keys/`), or from `--key FILE`. Both armoured and binary key files
+  are understood.
+* `repo_gpgcheck=1` requires and verifies `repodata/repomd.xml.asc` before the
+  metadata is parsed.
+* Policy: an invalid signature is always fatal; `gpgcheck=1` refuses packages
+  that are unsigned or signed by an unknown key; `gpgcheck=0` warns instead.
+
 ### Storage
 A custom binary cache (`packages.rpf` + `meta` per repository) written
 atomically. No SQLite dependency: the format is length-prefixed and loads in a
@@ -101,7 +126,8 @@ so a hostile id cannot escape the cache directory.
 | Area | Why it is deferred |
 |---|---|
 | **Scriptlet macro expansion** | `%pre`/`%post`/`%preun`/`%postun` are executed through `/bin/sh` (through `chroot` for an `--installroot`) and receive rpm's `$1` argument. Bodies that contain `%{...}` macros are not expanded yet, and scriptlets are skipped with a warning when RPF is not root. |
-| **GPG signature verification** | RPM signatures live inside the RPM's signature header and are parsed, but OpenPGP packet decoding, RSA/EdDSA verification and key import from `gpgkey=` are still to come. Downloads are checksum-verified only, and RPF says so on stderr. |
+| **EdDSA / ECDSA signatures** | RSA is what Fedora signs with, so RSA was implemented first. Ed25519 and ECDSA keys are detected, reported as unsupported and refused — never silently accepted. |
+| **Key trust model** | Expiry, revocation and web-of-trust are not evaluated. A key in the keyring is trusted, which matches `rpm --import`. |
 | **rpmdb interoperability** | Writing rpm's SQLite database is out of scope for now. RPF keeps `installed.rpf` (now including dependency records) and reads `rpm -qa` as a fallback so it can reason about an existing system. |
 | **`filelists.xml` / `other.xml`** | Only `primary.xml` is parsed. Full file queries (`rpf provides /usr/bin/foo` for non-primary files) need filelists, which is a phase 1.x item. |
 | **Modules, comps groups, delta RPMs, `--downloadonly` semantics** | Not part of the foundation. |
@@ -135,18 +161,16 @@ accident.
 * The real `basic-gzip.rpm` fixture is also installed into a scratch
   `--installroot` and compared file by file.
 
-`cargo test` runs 127 tests: 94 library unit tests, 4 CLI unit tests, 14
+`cargo test` runs 157 tests: 115 library unit tests, 4 CLI unit tests, 23
 installation tests and 15 end-to-end tests.
 
 ## Next steps
 
-1. **GPG verification** — OpenPGP packet decoding, RSA and Ed25519 signature
-   verification of the signed header, key import from `gpgkey=`, and
-   `repo_gpgcheck` over `repomd.xml`.
-2. **Scriptlet execution** — macro expansion and `chroot` execution inside the
-   install root, which removes the last `--noscripts` caveat.
-3. **rpmdb** — write rpm's own database so RPF and rpm agree on what is
+1. **rpmdb** — write rpm's own database so RPF and rpm agree on what is
    installed, or document the incompatibility as a deliberate choice.
+2. **Scriptlet macro expansion** — `%{_bindir}` and friends.
+3. **EdDSA/ECDSA verification** — needed only if a repository we must support
+   signs with those algorithms.
 4. **Polish** — parallel downloads, progress output, `filelists` for file
    queries, shell completion.
 

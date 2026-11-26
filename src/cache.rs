@@ -174,8 +174,14 @@ pub fn resolve_bases(repo: &Repo) -> Result<Vec<String>> {
 }
 
 /// Download and parse `repomd.xml` for a repository.
-pub fn fetch_repomd(repo: &Repo, bases: &[String]) -> Result<RepoMd> {
+///
+/// With `repo_gpgcheck=1` the metadata signature is verified first: an
+/// unsigned or badly signed `repomd.xml` is never parsed, let alone cached.
+pub fn fetch_repomd(config: &Config, repo: &Repo, bases: &[String]) -> Result<RepoMd> {
     let (_, bytes) = fetch::fetch_bytes_from_mirrors(bases, "repodata/repomd.xml")?;
+    if repo.repo_gpgcheck {
+        crate::verify::verify_repomd(config, repo, bases, &bytes)?;
+    }
     let text = String::from_utf8_lossy(&bytes);
     RepoMd::parse(&text).map_err(|e| e.context(format!("repository '{}' repomd.xml", repo.id)))
 }
@@ -192,7 +198,7 @@ pub enum SyncOutcome {
 /// Synchronise one repository's metadata into the cache.
 pub fn sync_repo(config: &Config, repo: &Repo, force: bool) -> Result<(CachedRepo, SyncOutcome)> {
     let bases = resolve_bases(repo)?;
-    let repomd = fetch_repomd(repo, &bases)?;
+    let repomd = fetch_repomd(config, repo, &bases)?;
 
     if let Some(existing) = read_cached(&config.conf.cachedir, &repo.id)? {
         let fresh = !force

@@ -8,7 +8,7 @@ use rpf::install as installer;
 use rpf::rpm::Rpm;
 use rpf::pkg::Package;
 use rpf::solver::{Resolution, Resolver, SolverOptions};
-use rpf::{digest, Error, Result};
+use rpf::{digest, verify, Error, Result};
 use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
@@ -35,6 +35,9 @@ Transactions:
   copr remove OWNER/PROJECT  Remove a COPR repository
   copr list                  List COPR repositories
 
+Verification:
+  verify FILE.rpm...         Check package signatures against trusted keys
+
 Maintenance:
   makecache                  Download repository metadata
   clean [--all|--metadata|--packages]
@@ -55,6 +58,7 @@ Global options:
       --noscripts            Do not run any package scriptlets
       --replacefiles         Allow packages to overwrite conflicting files
       --nodeps               Do not resolve dependencies
+      --key FILE             Trust the OpenPGP key in FILE (repeatable)
   -q, --quiet                Reduce output
   -v, --verbose              More output
   -h, --help                 Show this help
@@ -76,6 +80,8 @@ struct Args {
     noscripts: bool,
     replacefiles: bool,
     nodeps: bool,
+    /// Extra key files given with `--key`.
+    keys: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +128,7 @@ fn run(argv: &[String]) -> Result<i32> {
         "repoquery" => cmd_repoquery(&args),
         "download" => cmd_download(&args),
         "install" => cmd_install(&args),
+        "verify" | "check-signature" | "checksig" => cmd_verify(&args),
         "remove" | "erase" => cmd_remove(&args),
         "copr" => cmd_copr(&args),
         "clean" => cmd_clean(&args),
@@ -184,6 +191,7 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "--noscripts" => args.noscripts = true,
             "--replacefiles" => args.replacefiles = true,
             "--nodeps" => args.nodeps = true,
+            "--key" | "--import" => args.keys.push(PathBuf::from(value!())),
             "--releasever" => args.overrides.releasever = Some(value!()),
             "--installroot" => args.overrides.installroot = Some(PathBuf::from(value!())),
             "--cachedir" => args.overrides.cachedir = Some(PathBuf::from(value!())),
@@ -662,6 +670,12 @@ fn cmd_install(args: &Args) -> Result<i32> {
         }
     }
 
+    // Signature policy. Every package is checked; what happens on failure
+    // depends on the repository's gpgcheck setting.
+    if !args.overrides.no_gpgcheck {
+        check_signatures(&config, args, &resolution.install, &local)?;
+    }
+
     // Remove obsoleted packages first, then install in dependency order.
     let opts = installer::Options {
         installroot: config.conf.installroot.clone(),
@@ -705,6 +719,110 @@ fn cmd_install(args: &Args) -> Result<i32> {
         eprintln!("warning: {}", warning);
     }
     Ok(0)
+}
+
+/// Enforce the signature policy for every package in the transaction.
+///
+/// Returns an error (aborting the transaction before anything is written) when
+/// a signature is invalid, or when a `gpgcheck=1` repository's package cannot
+/// be verified. Softer cases produce warnings.
+fn check_signatures(
+    config: &Config,
+    args: &Args,
+    packages: &[Package],
+    local: &HashMap<String, PathBuf>,
+) -> Result<()> {
+    let mut keyring = verify::keyring_from_files(&args.keys)?;
+
+    // Only the repositories actually involved need their keys loaded.
+    let mut repo_ids: Vec<String> = packages.iter().map(|p| p.repo.clone()).collect();
+    repo_ids.sort();
+    repo_ids.dedup();
+    for id in &repo_ids {
+        if id == "@commandline" {
+            continue;
+        }
+        if let Some(repo) = config.repo(id) {
+            match verify::keys_for_repo(config, repo) {
+                Ok(keys) => keyring.add_keys(keys.keys),
+                Err(e) => {
+                    if repo.gpgcheck {
+                        return Err(Error::new(format!(
+                            "repository '{}' has gpgcheck=1 but its keys are unavailable: {}",
+                            repo.id, e
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let dir = config.conf.cachedir.join("packages");
+    for pkg in packages {
+        let path = match local.get(&pkg.nevra()) {
+            Some(path) => path.clone(),
+            None => dir.join(pkg.filename()),
+        };
+        let is_local = pkg.repo == "@commandline";
+        let gpgcheck = if is_local {
+            // Local files are verified when a key is known, as dnf's
+            // localpkg_gpgcheck=1 would, but we do not refuse to install an
+            // unsigned local file unless the user asked for keys.
+            !args.keys.is_empty()
+        } else {
+            config.repo(&pkg.repo).map(|r| r.gpgcheck).unwrap_or(false)
+        };
+
+        let verdict = match verify::check_package(&path, &keyring) {
+            Ok(v) => v,
+            Err(e) => {
+                if gpgcheck {
+                    return Err(Error::new(format!("{}: {}", pkg.nevra(), e)));
+                }
+                eprintln!("warning: {}: {}", pkg.nevra(), e);
+                continue;
+            }
+        };
+
+        if args.verbose {
+            println!("  signatures: {} — {}", pkg.nevra(), verdict.describe());
+        }
+
+        match &verdict {
+            verify::Verdict::Signed { .. } => {}
+            verify::Verdict::Invalid { reasons } => {
+                // A broken signature is tampering, never a relaxed setting.
+                return Err(Error::new(format!(
+                    "{}: signature is invalid ({}); refusing to install",
+                    pkg.nevra(),
+                    reasons.join("; ")
+                )));
+            }
+            _ if gpgcheck && is_local => {
+                return Err(Error::new(format!(
+                    "{}: {}; refusing to install a local package that cannot be verified with the supplied keys",
+                    pkg.nevra(),
+                    verdict.describe()
+                )))
+            }
+            _ if gpgcheck => {
+                return Err(Error::new(format!(
+                    "{}: {} and gpgcheck is enabled for repository '{}'",
+                    pkg.nevra(),
+                    verdict.describe(),
+                    pkg.repo
+                )))
+            }
+            _ => {
+                eprintln!(
+                    "warning: {} is not signature-verified ({})",
+                    pkg.nevra(),
+                    verdict.describe()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn available_local_spec(local: &HashMap<String, PathBuf>, spec: &str) -> bool {
@@ -813,6 +931,54 @@ fn cmd_clean(args: &Args) -> Result<i32> {
     }
     println!("Removed {} cache entr{}.", removed, if removed == 1 { "y" } else { "ies" });
     Ok(0)
+}
+
+fn cmd_verify(args: &Args) -> Result<i32> {
+    if args.rest.is_empty() {
+        return Err(Error::new("verify requires at least one .rpm file"));
+    }
+    let config = load_config(args)?;
+
+    // Trust: explicit keys first, then every enabled repository's gpgkey.
+    let mut keyring = verify::keyring_from_files(&args.keys)?;
+    let repos: Vec<&rpf::config::Repo> = config.repos.iter().filter(|r| r.enabled).collect();
+    match verify::keyring_for_repos(&config, &repos) {
+        Ok(repo_keys) => keyring.add_keys(repo_keys.keys),
+        Err(e) if !keyring.is_empty() => {
+            if args.verbose {
+                eprintln!("note: no repository keys available ({})", e);
+            }
+        }
+        Err(e) => return Err(e),
+    }
+
+    if keyring.is_empty() {
+        return Err(Error::new(
+            "no trusted keys: pass --key FILE, or configure gpgkey= in a repository",
+        ));
+    }
+    if args.verbose {
+        println!("Trusted keys: {}", keyring.describe().join(", "));
+    }
+
+    let mut failures = 0;
+    for file in &args.rest {
+        let path = PathBuf::from(file);
+        match verify::check_package(&path, &keyring) {
+            Ok(verdict) => {
+                let status = if verdict.is_trusted() { "OK" } else { "FAILED" };
+                println!("{:<40} {}  ({})", file, status, verdict.describe());
+                if !verdict.is_trusted() {
+                    failures += 1;
+                }
+            }
+            Err(e) => {
+                println!("{:<40} ERROR  ({})", file, e);
+                failures += 1;
+            }
+        }
+    }
+    Ok(if failures > 0 { 1 } else { 0 })
 }
 
 fn cmd_check(args: &Args) -> Result<i32> {

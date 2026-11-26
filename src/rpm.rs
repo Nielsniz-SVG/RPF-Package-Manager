@@ -102,8 +102,13 @@ pub mod tag {
     pub const SIG_SHA256: u32 = 273;
     pub const SIG_SIZE: u32 = 1000;
     pub const SIG_MD5: u32 = 1004;
-    pub const SIG_PAYLOADSIZE: u32 = 1002;
-    pub const SIG_PAYLOADDIGEST: u32 = 1007;
+    /// Legacy v3 signature covering header *and* payload.
+    pub const SIG_PGP: u32 = 1002;
+    pub const SIG_GPG: u32 = 1005;
+    pub const SIG_PAYLOADSIZE: u32 = 1007;
+    pub const SIG_RESERVEDSPACE: u32 = 1008;
+    pub const SIG_LONGSIZE: u32 = 270;
+    pub const SIG_LONGARCHIVESIZE: u32 = 271;
 }
 
 /// File flags (`RPMFILE_*`) from tag `FILEFLAGS`.
@@ -744,7 +749,34 @@ impl Rpm {
             .or_else(|| self.signature.bin(tag::SIG_DSA))
     }
 
-    /// The exact bytes the header signature covers: the main header blob,
+    /// Status flags stored in the signature header (tag 62).
+    pub fn signature_blobs(&self) -> Vec<SignatureBlob<'_>> {
+        let mut out = Vec::new();
+        for tag in [tag::SIG_DSA, tag::SIG_RSA, tag::SIG_PGP, tag::SIG_GPG] {
+            if let Some(bytes) = self.signature.bin(tag) {
+                out.push(SignatureBlob { tag, bytes });
+            }
+        }
+        out
+    }
+
+    /// The main header exactly as stored: what tag 268/267 signatures cover.
+    pub fn header_blob(&self) -> &[u8] {
+        let tail = &self.data[self.main_header_offset..];
+        if tail.len() < 16 {
+            return tail;
+        }
+        let il = be32(&tail[8..12]) as usize;
+        let dl = be32(&tail[12..16]) as usize;
+        let len = 16usize
+            .checked_add(il.saturating_mul(16))
+            .and_then(|v| v.checked_add(dl))
+            .unwrap_or(tail.len())
+            .min(tail.len());
+        &tail[..len]
+    }
+
+    /// The exact bytes a legacy signature covers: the main header blob,
     /// followed by the (compressed) payload.
     pub fn signed_payload(&self) -> &[u8] {
         &self.data[self.main_header_offset..]
@@ -752,6 +784,121 @@ impl Rpm {
 
     pub fn to_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Check every signature in the package against `keyring`.
+    ///
+    /// Returns the verification result for each signature present, so a caller
+    /// can decide whether "one good signature" is enough (rpm's rule for
+    /// multi-signed packages) and report the rest.
+    pub fn verify_signatures(
+        &self,
+        keyring: &crate::pgp::Keyring,
+    ) -> crate::Result<Vec<SignatureOutcome>> {
+        let mut outcomes = Vec::new();
+        for blob in self.signature_blobs() {
+            let data = if blob.covers_header_only() {
+                self.header_blob()
+            } else {
+                self.signed_payload()
+            };
+            let parsed = match crate::pgp::parse_signature(blob.bytes) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    outcomes.push(SignatureOutcome::Invalid {
+                        description: blob.description(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let issuer = parsed.issuer;
+            let key = keyring.find(issuer);
+            let description = blob.description();
+            let algorithm = parsed.algorithm_name();
+            let hash = parsed.hash_name();
+            match key {
+                None => outcomes.push(SignatureOutcome::NoKey {
+                    description,
+                    key_id: issuer.map(|id| format!("{:016X}", id)),
+                    algorithm,
+                }),
+                Some(key) => match crate::pgp::verify(key, &parsed, data) {
+                    Ok(()) => outcomes.push(SignatureOutcome::Verified {
+                        description,
+                        key_id: key.short_id(),
+                        algorithm,
+                        hash,
+                    }),
+                    Err(e) => outcomes.push(SignatureOutcome::Invalid {
+                        description,
+                        reason: e.to_string(),
+                    }),
+                },
+            }
+        }
+        Ok(outcomes)
+    }
+}
+
+/// The result of checking one signature in a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureOutcome {
+    Verified {
+        description: &'static str,
+        key_id: String,
+        algorithm: &'static str,
+        hash: &'static str,
+    },
+    NoKey {
+        description: &'static str,
+        key_id: Option<String>,
+        algorithm: &'static str,
+    },
+    Invalid {
+        description: &'static str,
+        reason: String,
+    },
+}
+
+impl SignatureOutcome {
+    pub fn is_verified(&self) -> bool {
+        matches!(self, SignatureOutcome::Verified { .. })
+    }
+
+    /// A package is acceptable when at least one signature verifies and none
+    /// is outright invalid, matching rpm's behaviour for multi-signed packages.
+    pub fn acceptable(outcomes: &[SignatureOutcome]) -> bool {
+        !outcomes.is_empty()
+            && outcomes.iter().any(|o| o.is_verified())
+            && !outcomes
+                .iter()
+                .any(|o| matches!(o, SignatureOutcome::Invalid { .. }))
+    }
+}
+
+/// A signature stored in the RPM's signature header, with the bytes it covers.
+#[derive(Debug, Clone, Copy)]
+pub struct SignatureBlob<'a> {
+    pub tag: u32,
+    pub bytes: &'a [u8],
+}
+
+impl SignatureBlob<'_> {
+    /// Header signatures (267, 268) cover the main header only; the legacy
+    /// PGP/GPG tags (1002, 1005) cover header plus payload.
+    pub fn covers_header_only(&self) -> bool {
+        matches!(self.tag, tag::SIG_RSA | tag::SIG_DSA)
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self.tag {
+            tag::SIG_RSA => "RSA header signature",
+            tag::SIG_DSA => "DSA/EdDSA header signature",
+            tag::SIG_PGP => "PGP header+payload signature",
+            tag::SIG_GPG => "GPG header+payload signature",
+            _ => "signature",
+        }
     }
 }
 
@@ -1121,6 +1268,90 @@ mod tests {
             "expected a parsed rich dependency: {:?}",
             all.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn verifies_a_real_rpm_signature() {
+        let rpm = Rpm::open(&fixture("rpmsig-hello-rsa.rpm")).unwrap();
+        let mut ring = crate::pgp::Keyring::new();
+        ring.add_armored(
+            &std::fs::read_to_string(fixture("keys/rpm.org-rsa-2048-test.pub")).unwrap(),
+        )
+        .unwrap();
+
+        let outcomes = rpm.verify_signatures(&ring).unwrap();
+        assert!(!outcomes.is_empty(), "package has signatures");
+        assert!(
+            SignatureOutcome::acceptable(&outcomes),
+            "signature should verify: {:?}",
+            outcomes
+        );
+        let verified = outcomes.iter().find(|o| o.is_verified()).unwrap();
+        match verified {
+            SignatureOutcome::Verified { hash, algorithm, .. } => {
+                assert_eq!(*algorithm, "RSA");
+                assert_eq!(*hash, "SHA-256");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn verifies_a_sha512_signature_with_a_4096_bit_key() {
+        let rpm = Rpm::open(&fixture("basic-uncompressed-signed.rpm")).unwrap();
+        let mut ring = crate::pgp::Keyring::new();
+        ring.add_armored(
+            &std::fs::read_to_string(fixture("keys/rpm-testkey-v4-rsa4096.asc")).unwrap(),
+        )
+        .unwrap();
+
+        let outcomes = rpm.verify_signatures(&ring).unwrap();
+        assert!(
+            SignatureOutcome::acceptable(&outcomes),
+            "signature should verify: {:?}",
+            outcomes
+        );
+        assert!(outcomes.iter().any(|o| matches!(
+            o,
+            SignatureOutcome::Verified { hash: "SHA-512", .. }
+        )));
+    }
+
+    #[test]
+    fn tampering_with_the_header_breaks_the_signature() {
+        let rpm = Rpm::open(&fixture("rpmsig-hello-rsa.rpm")).unwrap();
+        let mut ring = crate::pgp::Keyring::new();
+        ring.add_armored(
+            &std::fs::read_to_string(fixture("keys/rpm.org-rsa-2048-test.pub")).unwrap(),
+        )
+        .unwrap();
+
+        // Flip a byte inside the signed header region.
+        let mut data = rpm.to_bytes().to_vec();
+        let target = rpm.main_header_offset + rpm.header_blob().len() - 8;
+        data[target] ^= 0x01;
+        let tampered = Rpm::parse(data).unwrap();
+
+        let outcomes = tampered.verify_signatures(&ring).unwrap();
+        assert!(
+            !SignatureOutcome::acceptable(&outcomes),
+            "a modified header must not verify: {:?}",
+            outcomes
+        );
+    }
+
+    #[test]
+    fn unknown_key_reports_no_key() {
+        let rpm = Rpm::open(&fixture("rpmsig-hello-rsa.rpm")).unwrap();
+        let mut ring = crate::pgp::Keyring::new();
+        ring.add_armored(
+            &std::fs::read_to_string(fixture("keys/rpm-testkey-v4-rsa4096.asc")).unwrap(),
+        )
+        .unwrap();
+
+        let outcomes = rpm.verify_signatures(&ring).unwrap();
+        assert!(!SignatureOutcome::acceptable(&outcomes));
+        assert!(outcomes.iter().any(|o| matches!(o, SignatureOutcome::NoKey { .. })));
     }
 
     #[test]

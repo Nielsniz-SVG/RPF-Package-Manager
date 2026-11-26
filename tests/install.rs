@@ -347,3 +347,224 @@ fn real_fedora_rpm_installs_into_a_scratch_root() {
     assert!(!file_exists(&root.join("usr/bin/rpm-basic")));
     assert!(!file_exists(&root.join("usr/lib/rpm-basic/module/hello.py")));
 }
+
+#[test]
+fn installs_a_signed_package_from_a_gpgcheck_repository() {
+    let fx = RepoFixture::new("gpg-ok");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    fx.publish_existing(&fixture.join("rpmsig-hello-rsa.rpm"));
+    fx.require_signatures(&fixture.join("keys/rpm.org-rsa-2048-test.pub"));
+
+    let root = fx.ensure_installroot();
+    // The real hello binary needs glibc, which this test repository does not
+    // carry; the point here is the signature check.
+    let out = fx.rpf_root(&["install", "--nodeps", "hello"]);
+    assert_success(&out, "install signed package");
+    assert!(file_exists(&root.join("usr/bin/hello")), "{}", text(&out));
+}
+
+#[test]
+fn refuses_an_unsigned_package_from_a_gpgcheck_repository() {
+    let fx = RepoFixture::new("gpg-unsigned");
+    fx.publish(&[PkgSpec::new("unsigned", "1.0")
+        .with_file(FileSpec::new("/usr/bin/unsigned", "x\n"))]);
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    fx.require_signatures(&fixture.join("keys/rpm.org-rsa-2048-test.pub"));
+
+    let root = fx.ensure_installroot();
+    let out = fx.rpf_root(&["install", "unsigned"]);
+    assert!(!out.status.success(), "unsigned package must be refused");
+    let msg = text(&out);
+    assert!(msg.contains("not signed"), "{}", msg);
+    assert!(!file_exists(&root.join("usr/bin/unsigned")));
+}
+
+#[test]
+fn refuses_a_package_signed_by_an_unknown_key() {
+    let fx = RepoFixture::new("gpg-wrongkey");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    fx.publish_existing(&fixture.join("rpmsig-hello-rsa.rpm"));
+    // A different key than the one that signed the package.
+    fx.require_signatures(&fixture.join("keys/rpm-testkey-v4-rsa4096.asc"));
+
+    let root = fx.ensure_installroot();
+    let out = fx.rpf_root(&["install", "--nodeps", "hello"]);
+    assert!(!out.status.success(), "unknown signer must be refused");
+    assert!(text(&out).contains("unknown key"), "{}", text(&out));
+    assert!(!file_exists(&root.join("usr/bin/hello")));
+}
+
+#[test]
+fn verify_subcommand_reports_and_exits() {
+    let fx = RepoFixture::new("verify-cmd");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let rpm = fixture.join("rpmsig-hello-rsa.rpm");
+    let key = fixture.join("keys/rpm.org-rsa-2048-test.pub");
+
+    let out = fx.rpf(&["verify", "--key", key.to_str().unwrap(), rpm.to_str().unwrap()]);
+    assert_success(&out, "verify good signature");
+    assert!(text(&out).contains("OK"), "{}", text(&out));
+
+    let wrong = fixture.join("keys/rpm-testkey-v4-rsa4096.asc");
+    let out = fx.rpf(&["verify", "--key", wrong.to_str().unwrap(), rpm.to_str().unwrap()]);
+    assert!(!out.status.success(), "wrong key must fail");
+    assert!(text(&out).contains("FAILED"), "{}", text(&out));
+}
+
+#[test]
+fn tampering_with_a_signed_package_blocks_installation() {
+    let fx = RepoFixture::new("gpg-tamper");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let source = fixture.join("rpmsig-hello-rsa.rpm");
+    let published = fx.publish_existing(&source);
+
+    // Corrupt the payload after the metadata was written, so only the
+    // signature check can catch it... the checksum in primary.xml still
+    // catches this first, which is also correct. Assert on the outcome.
+    let mut data = std::fs::read(&published).unwrap();
+    let len = data.len();
+    data[len - 40] ^= 0xff;
+    std::fs::write(&published, &data).unwrap();
+
+    let root = fx.ensure_installroot();
+    let out = fx.rpf_root(&["install", "--nodeps", "hello"]);
+    assert!(!out.status.success(), "tampered package must not install");
+    assert!(!file_exists(&root.join("usr/bin/hello")));
+}
+
+fn signed_repo_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/signed-repo")
+}
+
+/// Write a `.repo` file pointing at `baseurl` with the given gpg settings.
+fn write_repo_file(dir: &std::path::Path, baseurl: &std::path::Path, key: &std::path::Path, repo_gpgcheck: bool) {
+    // Two keys: one signs the metadata, the other signed the package.
+    let pkg_key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys/rpm.org-rsa-2048-test.pub");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("signed.repo"),
+        format!(
+            "[signed]\nname=Signed Repo\nbaseurl=file://{}\nenabled=1\ngpgcheck=1\nrepo_gpgcheck={}\ngpgkey=file://{} file://{}\n",
+            baseurl.display(),
+            if repo_gpgcheck { 1 } else { 0 },
+            key.display(),
+            pkg_key.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn run_with_repos(reposdir: &std::path::Path, installroot: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut full: Vec<String> = vec![
+        "--installroot".to_string(),
+        installroot.display().to_string(),
+    ];
+    full.extend(args.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+    std::process::Command::new(env!("CARGO_BIN_EXE_rpf"))
+        .args(&refs)
+        .env("RPF_REPOSDIR", reposdir)
+        .env("RPF_RELEASEVER", "41")
+        .env("RPF_BASEARCH", "x86_64")
+        .env_remove("RPF_CACHEDIR")
+        .env_remove("RPF_DBPATH")
+        .env_remove("RPF_INSTALLROOT")
+        .output()
+        .expect("failed to run rpf")
+}
+
+#[test]
+fn repo_gpgcheck_accepts_a_correctly_signed_repomd() {
+    let fx = RepoFixture::new("repomd-ok");
+    let root = fx.ensure_installroot();
+    let reposdir = fx.path("signed-repos.d");
+    let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys/rpf-testkey.asc");
+    write_repo_file(&reposdir, &signed_repo_dir(), &key, true);
+
+    let out = run_with_repos(&reposdir, &root, &["install", "--nodeps", "hello"]);
+    assert_success(&out, "install from repo with repo_gpgcheck=1");
+    assert!(
+        file_exists(&root.join("usr/bin/hello")),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn repo_gpgcheck_rejects_tampered_metadata() {
+    let fx = RepoFixture::new("repomd-tampered");
+    let root = fx.ensure_installroot();
+
+    // Copy the signed repository, then change the metadata without re-signing.
+    let copy = fx.path("tampered-repo");
+    copy_dir(&signed_repo_dir(), &copy);
+    let repomd = copy.join("repodata/repomd.xml");
+    let tampered = std::fs::read_to_string(&repomd)
+        .unwrap()
+        .replace("<revision>1700000000</revision>", "<revision>1700000001</revision>");
+    std::fs::write(&repomd, tampered).unwrap();
+
+    let reposdir = fx.path("signed-repos.d");
+    let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys/rpf-testkey.asc");
+    write_repo_file(&reposdir, &copy, &key, true);
+
+    let out = run_with_repos(&reposdir, &root, &["makecache"]);
+    assert!(!out.status.success(), "tampered metadata must be refused");
+    let msg = text(&out);
+    assert!(
+        msg.contains("signature") && msg.contains("invalid"),
+        "{}",
+        msg
+    );
+}
+
+#[test]
+fn repo_gpgcheck_rejects_metadata_without_a_signature() {
+    let fx = RepoFixture::new("repomd-unsigned");
+    let root = fx.ensure_installroot();
+    let copy = fx.path("unsigned-repo");
+    copy_dir(&signed_repo_dir(), &copy);
+    std::fs::remove_file(copy.join("repodata/repomd.xml.asc")).unwrap();
+
+    let reposdir = fx.path("signed-repos.d");
+    let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys/rpf-testkey.asc");
+    write_repo_file(&reposdir, &copy, &key, true);
+
+    let out = run_with_repos(&reposdir, &root, &["makecache"]);
+    assert!(!out.status.success(), "unsigned metadata must be refused");
+    assert!(
+        text(&out).contains("repomd.xml.asc"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn repo_gpgcheck_off_accepts_unsigned_metadata() {
+    let fx = RepoFixture::new("repomd-off");
+    let root = fx.ensure_installroot();
+    let reposdir = fx.path("signed-repos.d");
+    let key = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys/rpf-testkey.asc");
+    write_repo_file(&reposdir, &signed_repo_dir(), &key, false);
+
+    let out = run_with_repos(&reposdir, &root, &["makecache"]);
+    assert_success(&out, "repo_gpgcheck=0");
+}
+
+fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}

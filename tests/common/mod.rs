@@ -633,6 +633,108 @@ impl RepoFixture {
         written
     }
 
+    /// Publish a signing key (as a `file://` path) and make the repository
+    /// demand signatures, the way Fedora's repositories do.
+    pub fn require_signatures(&self, key_file: &Path) -> PathBuf {
+        let key_dest = self.path("key.gpg");
+        fs::copy(key_file, &key_dest).unwrap();
+        let repo_file = self.path("repos.d/test.repo");
+        fs::write(
+            &repo_file,
+            format!(
+                "[test]\nname=RPF Test Repo\nbaseurl=file://{}\nenabled=1\ngpgcheck=1\ngpgkey=file://{}\n",
+                self.path("repo").display(),
+                key_dest.display()
+            ),
+        )
+        .unwrap();
+        key_dest
+    }
+
+    /// Add an existing `.rpm` file to the repository, describing it from its
+    /// own header so the metadata and the package agree.
+    pub fn publish_existing(&self, src: &Path) -> PathBuf {
+        let bytes = fs::read(src).unwrap();
+        let rpm = rpf::rpm::Rpm::parse(bytes.clone()).unwrap();
+        let pkg = rpm.package();
+        let filename = format!("{}.rpm", pkg.nevra());
+        let dest = self.path(&format!("repo/Packages/{}", filename));
+        fs::write(&dest, &bytes).unwrap();
+
+        let checksum = digest::hex(&digest::sha256(&bytes));
+        let provides = std::iter::once(format!(
+            "<rpm:entry name=\"{}\" flags=\"EQ\" epoch=\"{}\" ver=\"{}\" rel=\"{}\"/>",
+            pkg.name,
+            pkg.epoch,
+            pkg.version,
+            pkg.release
+        ))
+        .collect::<String>();
+        let requires = pkg
+            .requires
+            .iter()
+            .map(|r| format!("<rpm:entry name=\"{}\"/>", r.name))
+            .collect::<String>();
+
+        let entry = format!(
+            r#"<package type="rpm">
+  <name>{name}</name><arch>{arch}</arch>
+  <version epoch="{epoch}" ver="{version}" rel="{release}"/>
+  <checksum type="sha256" pkgid="YES">{checksum}</checksum>
+  <summary>{summary}</summary><description>{summary}</description>
+  <packager>RPF tests</packager><url>https://example.org</url>
+  <time file="1700000000" build="1700000000"/>
+  <size package="{size}" installed="{size}" archive="{size}"/>
+  <location href="Packages/{filename}"/>
+  <format>
+    <rpm:license>MIT</rpm:license><rpm:vendor>RPF</rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:header-range start="1000" end="2000"/>
+    <rpm:provides>{provides}</rpm:provides>
+    <rpm:requires>{requires}</rpm:requires>
+  </format>
+</package>
+"#,
+            name = pkg.name,
+            arch = pkg.arch,
+            epoch = pkg.epoch,
+            version = pkg.version,
+            release = pkg.release,
+            checksum = checksum,
+            summary = pkg.summary,
+            size = bytes.len(),
+            filename = filename,
+            provides = provides,
+            requires = requires,
+        );
+
+        let primary = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <metadata xmlns=\"http://linux.duke.edu/metadata/common\" \
+             xmlns:rpm=\"http://linux.duke.edu/metadata/rpm\">\n{}</metadata>\n",
+            entry
+        );
+        let plain = self.path("repo/repodata/primary.xml");
+        fs::write(&plain, &primary).unwrap();
+        let compressed = gzip(primary.as_bytes());
+        fs::write(self.path("repo/repodata/primary.xml.gz"), &compressed).unwrap();
+        let repomd = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <repomd xmlns=\"http://linux.duke.edu/metadata/repo\">\
+             <revision>1700000000</revision><data type=\"primary\">\
+             <checksum type=\"sha256\">{}</checksum>\
+             <open-checksum type=\"sha256\">{}</open-checksum>\
+             <location href=\"repodata/primary.xml.gz\"/>\
+             <timestamp>1700000000</timestamp><size>{}</size>\
+             </data></repomd>\n",
+            digest::hex(&digest::sha256(&compressed)),
+            digest::hex(&digest::sha256(primary.as_bytes())),
+            compressed.len()
+        );
+        fs::write(self.path("repo/repodata/repomd.xml"), repomd).unwrap();
+        dest
+    }
+
     pub fn installroot(&self) -> PathBuf {
         self.path("root")
     }
