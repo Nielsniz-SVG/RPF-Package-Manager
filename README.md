@@ -82,7 +82,8 @@ verification and scriptlets — see the table below and
 | Other curves (P-384, P-521, Brainpool), DSA | **Not yet** — reported and refused, never silently accepted |
 | Scriptlet execution (`%pre`/`%post`/`%preun`/`%postun`) | **Working** — honours `-p INTERPRETER`, runs inside `chroot` for `--installroot`, passes rpm's `$1` |
 | Embedded scriptlet interpreters (`<lua>`) | **Not yet** — reported and skipped, never silently ignored |
-| Reading/writing the real rpmdb | **Not yet** — uses its own DB, reads `rpm -qa` as fallback |
+| Reading the real rpmdb | **Working** — `rpm -qa --xml --files`, `--queryformat` fallback |
+| Writing the real rpmdb | **Not yet** — installs are recorded in RPF's own DB |
 
 Scriptlets only run when RPF has root; when they are skipped, `rpf` says so on
 stderr instead of staying quiet. Scriptlets written for an embedded interpreter
