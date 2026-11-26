@@ -99,6 +99,15 @@ dependency that does not name one ("`foo >= 1.0`" matches `1.0-99.fc43`).
 * RSA verification with hand-written arbitrary-precision arithmetic: CIOS
   Montgomery multiplication and square-and-multiply, with the wide-intermediate
   handling an RSA modulus with its top bit set requires.
+* EdDSA (Ed25519, algorithm 22) and ECDSA (NIST P-256, algorithm 19) with a
+  prime-field layer over the same arithmetic and projective point formulas.
+  Ed25519 is checked against the RFC 8032 §7.1 vectors; both are checked against
+  packages rpm signed (`tests/fixtures/rpmsig-eddsa.rpm`, `rpmsig-ecdsa.rpm`)
+  with the distribution keys. Signature values arrive as MPIs and are
+  left-padded to the curve width, since MPIs drop leading zero octets.
+* Curve OIDs are matched explicitly (Ed25519 `2b06010401da470f01`, P-256
+  `2a8648ce3d030107`), so a P-384 or Brainpool key is reported as unsupported
+  instead of being fed to the wrong curve.
 * The v4 signature trailer is hashed as `0x04 0xff || BE32(6 + hashed_len)` —
   the count covers the signature packet's own hashed data, not the document.
   This was established against packages signed by rpm itself
@@ -139,7 +148,7 @@ so a hostile id cannot escape the cache directory.
 | Area | Why it is deferred |
 |---|---|
 | **Embedded scriptlet interpreters** | `%pre`/`%post`/`%preun`/`%postun` run through the interpreter the package names (`%post -p /sbin/ldconfig` works), inside `chroot` for an `--installroot`, with rpm's `$1` argument. Embedded interpreters such as `<lua>` are reported and skipped: RPF has no Lua. |
-| **EdDSA / ECDSA signatures** | RSA is what Fedora signs with, so RSA was implemented first. Ed25519 and ECDSA keys are detected, reported as unsupported and refused — never silently accepted. |
+| **Other signature curves (P-384, P-521, Brainpool) and DSA** | RSA, Ed25519 and NIST P-256 cover Fedora, RPM Fusion and the packages rpm itself can sign with in practice. Any other algorithm is detected, reported as unsupported and refused — never silently accepted. |
 | **Key trust model** | Expiry, revocation and web-of-trust are not evaluated. A key in the keyring is trusted, which matches `rpm --import`. |
 | **Writing the rpmdb** | Reading is implemented; writing rpm's own database is not, by choice. Installing with RPF therefore does not make a package visible to `rpm -qa` or to dnf. |
 | **`filelists.xml` / `other.xml`** | Only `primary.xml` is parsed. Full file queries (`rpf provides /usr/bin/foo` for non-primary files) need filelists, which is a phase 1.x item. |
@@ -174,19 +183,17 @@ accident.
 * The real `basic-gzip.rpm` fixture is also installed into a scratch
   `--installroot` and compared file by file.
 
-`cargo test` runs 162 tests: 118 library unit tests, 4 CLI unit tests, 25
-installation tests and 15 end-to-end tests. The rpmdb tests run against a
-stand-in `rpm` executable that emits genuine `--xml` output, so the parsing and
-the fallback paths are exercised without rpm being installed.
+`cargo test` runs 170 tests: 122 library unit tests, 4 CLI unit tests, 25
+installation tests, 15 end-to-end tests and 4 curve-signature tests. The rpmdb
+tests run against a stand-in `rpm` executable that emits genuine `--xml` output,
+so the parsing and the fallback paths are exercised without rpm being installed.
 
 ## Next steps
 
-1. **EdDSA/ECDSA verification** — needed only if a repository we must support
-   signs with those algorithms.
-2. **`filelists.xml`** — so file queries work for files that are not in
+1. **`filelists.xml`** — so file queries work for files that are not in
    `primary.xml`.
-3. **Polish** — parallel downloads, progress output, shell completion.
+2. **Polish** — parallel downloads, progress output, shell completion.
 
-Phase 2 (feature parity and beyond) starts only once 1–3 are done and the
+Phase 2 (feature parity and beyond) starts only once 1–2 are done and the
 foundation installs, upgrades and removes packages cleanly on a real Fedora
 system.

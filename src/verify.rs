@@ -34,7 +34,8 @@ pub enum Verdict {
     UnknownKey { key_ids: Vec<String> },
     /// A signature is present and does not verify.
     Invalid { reasons: Vec<String> },
-    /// The algorithm is not supported yet (EdDSA, ECDSA).
+    /// The signature uses an algorithm or curve RPF cannot check (DSA, or a
+    /// curve other than NIST P-256). Reported rather than treated as invalid.
     Unsupported { reason: String },
 }
 
@@ -91,7 +92,7 @@ pub fn check_rpm(rpm: &Rpm, keyring: &Keyring) -> Result<Verdict> {
         }
     }
     if let Some(reason) = outcomes.iter().find_map(|o| match o {
-        SignatureOutcome::Invalid { reason, .. } if reason.contains("cannot verify yet") => {
+        SignatureOutcome::Invalid { reason, .. } if reason.contains("cannot verify") => {
             Some(reason.clone())
         }
         _ => None,

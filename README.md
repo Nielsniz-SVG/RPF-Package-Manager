@@ -75,10 +75,10 @@ verification and scriptlets — see the table below and
 | File conflict detection before the transaction | **Working** |
 | `remove`, directory pruning, "required by" protection | **Working** |
 | `--test`, `--nodeps`, `--replacefiles` | **Working** |
-| GPG signature verification of RPMs (RSA, SHA-256/384/512) | **Working** |
+| GPG signature verification of RPMs (RSA, Ed25519, NIST P-256; SHA-256/384/512) | **Working** |
 | `repo_gpgcheck` metadata signatures | **Working** |
 | Key import from `gpgkey=`, `rpf verify --key FILE` | **Working** |
-| EdDSA (Ed25519) and ECDSA signatures | **Not yet** — reported and refused, never silently accepted |
+| Other curves (P-384, P-521, Brainpool), DSA | **Not yet** — reported and refused, never silently accepted |
 | Scriptlet execution (`%pre`/`%post`/`%preun`/`%postun`) | **Working** — honours `-p INTERPRETER`, runs inside `chroot` for `--installroot`, passes rpm's `$1` |
 | Embedded scriptlet interpreters (`<lua>`) | **Not yet** — reported and skipped, never silently ignored |
 | Reading/writing the real rpmdb | **Not yet** — uses its own DB, reads `rpm -qa` as fallback |
@@ -87,9 +87,13 @@ Scriptlets only run when RPF has root; when they are skipped, `rpf` says so on
 stderr instead of staying quiet. Scriptlets written for an embedded interpreter
 (`%post -p <lua>`) are reported and skipped, since RPF has no Lua runtime.
 
-Signature verification covers RSA keys, which is what Fedora signs with. A key
-or signature using EdDSA or ECDSA is reported as unsupported and the package is
-refused rather than installed unverified. Key expiry, revocation and web of
+Signature verification covers RSA (Fedora's own keys), EdDSA over Ed25519 and
+ECDSA over NIST P-256, all implemented in this repository with no crypto
+dependencies — including the elliptic-curve arithmetic. Both curve families are
+checked against packages signed by rpm and the real distribution keys
+(`tests/fixtures/rpmsig-eddsa.rpm`, `tests/fixtures/rpmsig-ecdsa.rpm`). A
+signature on any other curve, or DSA, is reported as unsupported and the package
+is refused rather than installed unverified. Key expiry, revocation and web of
 trust are not evaluated: a key present in the configured keyring is trusted,
 the same model `rpm --import` uses.
 
@@ -97,7 +101,7 @@ the same model `rpm --import` uses.
 
 ```sh
 cargo build --release      # -> target/release/rpf
-cargo test                 # 162 tests: unit, end-to-end, installation
+cargo test                 # 170 tests: unit, end-to-end, installation
 ```
 
 Requirements: a Rust toolchain (1.70+). At runtime on Fedora, RPF uses `curl`

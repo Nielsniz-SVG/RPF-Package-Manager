@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod deps;
 pub mod digest;
+pub mod ec;
 pub mod error;
 pub mod fetch;
 pub mod ini;

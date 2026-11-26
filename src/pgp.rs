@@ -22,9 +22,9 @@
 //!
 //! ## What is not verified
 //!
-//! * EdDSA (algorithm 22) and ECDSA (19) keys are rejected with a clear error
-//!   rather than silently accepted. Fedora's own packages are RSA, but RPM
-//!   Fusion may not be — this is called out in the README.
+//! * RSA (algorithms 1/2/3), EdDSA (22, Ed25519) and ECDSA (19, NIST P-256)
+//!   are verified. Other curves (NIST P-384/P-521, Brainpool) are rejected
+//!   with a clear error rather than silently accepted.
 //! * Key expiry, revocation and trust levels are not checked: a key that is
 //!   present in the configured keyring is trusted, exactly like `rpm --import`
 //!   followed by `gpgcheck=1`.
@@ -37,12 +37,41 @@ use crate::{Error, Result};
 pub const ALGO_RSA: u8 = 1;
 pub const ALGO_RSA_ENCRYPT: u8 = 2;
 pub const ALGO_RSA_SIGN: u8 = 3;
+pub const ALGO_ECDSA: u8 = 19;
+pub const ALGO_EDDSA: u8 = 22;
+
+/// Curve OIDs, as the dotted-octet strings OpenPGP keys carry.
+const OID_ED25519: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01];
+const OID_NIST_P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 
 /// Hash algorithms (RFC 4880 §9.4).
 pub const HASH_SHA1: u8 = 2;
 pub const HASH_SHA256: u8 = 8;
 pub const HASH_SHA384: u8 = 9;
 pub const HASH_SHA512: u8 = 10;
+
+/// Curve key material, for the algorithms that are not RSA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurveKey {
+    /// Ed25519: the 32-byte compressed point.
+    Ed25519(Vec<u8>),
+    /// NIST P-256: the affine coordinates, 32 bytes each.
+    P256 { x: Vec<u8>, y: Vec<u8> },
+}
+
+impl CurveKey {
+    /// Bytes per signature component.
+    pub fn scalar_len(&self) -> usize {
+        32
+    }
+
+    pub fn curve_name(&self) -> &'static str {
+        match self {
+            CurveKey::Ed25519(_) => "Ed25519",
+            CurveKey::P256 { .. } => "NIST P-256",
+        }
+    }
+}
 
 /// A public key we can verify signatures with.
 #[derive(Debug, Clone)]
@@ -60,6 +89,8 @@ pub struct PublicKey {
     pub algo: u8,
     /// True for a subkey (tag 14): signing subkeys are common.
     pub subkey: bool,
+    /// Curve material for EdDSA/ECDSA keys; `None` for RSA.
+    pub curve: Option<CurveKey>,
 }
 
 impl PublicKey {
@@ -69,6 +100,9 @@ impl PublicKey {
     }
 
     pub fn bits(&self) -> usize {
+        if self.curve.is_some() {
+            return 256;
+        }
         let mut n = self.n.clone();
         while n.first() == Some(&0) {
             n.remove(0);
@@ -178,19 +212,22 @@ impl Signature {
 
 /// Verify `signature` over `data` with `key`.
 pub fn verify(key: &PublicKey, signature: &Signature, data: &[u8]) -> Result<()> {
-    if !matches!(key.algo, ALGO_RSA | ALGO_RSA_ENCRYPT | ALGO_RSA_SIGN) {
+    if !matches!(
+        key.algo,
+        ALGO_RSA | ALGO_RSA_ENCRYPT | ALGO_RSA_SIGN | ALGO_ECDSA | ALGO_EDDSA
+    ) {
         return Err(Error::new(format!(
-            "key {} uses {} signatures, which RPF cannot verify yet",
+            "key {} uses {} signatures, which RPF cannot verify",
             key.short_id(),
             key_algo_name(key.algo)
         )));
     }
     if !matches!(
         signature.pubkey_algo,
-        ALGO_RSA | ALGO_RSA_ENCRYPT | ALGO_RSA_SIGN
+        ALGO_RSA | ALGO_RSA_ENCRYPT | ALGO_RSA_SIGN | ALGO_ECDSA | ALGO_EDDSA
     ) {
         return Err(Error::new(format!(
-            "signature uses {}, which RPF cannot verify yet (RSA only)",
+            "signature uses {}, which RPF cannot verify (RSA, Ed25519 and NIST P-256 only)",
             signature.algorithm_name()
         )));
     }
@@ -206,6 +243,10 @@ pub fn verify(key: &PublicKey, signature: &Signature, data: &[u8]) -> Result<()>
             "signature by key {} is invalid: digest does not match the signed data",
             key.short_id()
         )));
+    }
+
+    if let Some(curve) = &key.curve {
+        return verify_curve(key, curve, signature, &digest_bytes);
     }
 
     let value = signature
@@ -227,6 +268,92 @@ pub fn verify(key: &PublicKey, signature: &Signature, data: &[u8]) -> Result<()>
         )));
     }
     Ok(())
+}
+
+/// Verify an EdDSA or ECDSA signature. Both sign `digest_bytes`, the v4
+/// signature digest including the trailer.
+fn verify_curve(
+    key: &PublicKey,
+    curve: &CurveKey,
+    signature: &Signature,
+    digest_bytes: &[u8],
+) -> Result<()> {
+    let size = curve.scalar_len();
+    if signature.mpis.len() < 2 {
+        return Err(Error::new(format!(
+            "{} signature packet carries {} value(s), expected 2",
+            curve.curve_name(),
+            signature.mpis.len()
+        )));
+    }
+    // MPIs drop leading zero octets; curve values are fixed width.
+    let first = left_pad(&signature.mpis[0], size, curve.curve_name())?;
+    let second = left_pad(&signature.mpis[1], size, curve.curve_name())?;
+
+    let outcome = match curve {
+        CurveKey::Ed25519(public) => {
+            if signature.hash_algo != HASH_SHA512 {
+                return Err(Error::new(format!(
+                    "EdDSA signatures must use SHA-512, this one uses {}",
+                    signature.hash_name()
+                )));
+            }
+            let mut sig = Vec::with_capacity(64);
+            sig.extend_from_slice(&first);
+            sig.extend_from_slice(&second);
+            crate::ec::ed25519_verify(public, digest_bytes, &sig)
+        }
+        CurveKey::P256 { x, y } => {
+            let mut public = Vec::with_capacity(64);
+            public.extend_from_slice(x);
+            public.extend_from_slice(y);
+            crate::ec::p256_verify(&public, digest_bytes, &first, &second)
+        }
+    };
+
+    outcome.map_err(|e| {
+        Error::new(format!(
+            "signature by key {} is invalid: {}",
+            key.short_id(),
+            e
+        ))
+    })
+}
+
+/// Left-pad a MPI to a fixed width, rejecting anything that does not fit.
+fn left_pad(value: &[u8], len: usize, curve: &str) -> Result<Vec<u8>> {
+    if value.len() > len {
+        return Err(Error::new(format!(
+            "{} signature value is {} bytes, expected at most {}",
+            curve,
+            value.len(),
+            len
+        )));
+    }
+    let mut out = vec![0u8; len - value.len()];
+    out.extend_from_slice(value);
+    Ok(out)
+}
+
+/// Strip the 0x40 prefix OpenPGP puts in front of an EdDSA point.
+fn strip_point_prefix(point: &[u8], prefix: u8, len: usize, curve: &str) -> Result<Vec<u8>> {
+    if point.len() == len + 1 && point[0] == prefix {
+        return Ok(point[1..].to_vec());
+    }
+    // GnuPG writes 0x40 || point, but an older key may store the bare point.
+    if point.len() == len {
+        return Ok(point.to_vec());
+    }
+    Err(Error::new(format!(
+        "{} public key point is {} bytes, expected {}",
+        curve,
+        point.len(),
+        len + 1
+    )))
+}
+
+fn hex_oid(oid: &[u8]) -> String {
+    oid.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn key_algo_name(algo: u8) -> &'static str {
@@ -518,16 +645,77 @@ fn parse_public_key(body: &[u8]) -> Result<PublicKey> {
         return Err(Error::new("truncated public key packet"));
     }
     let algo = body[5];
-    if !matches!(algo, ALGO_RSA | ALGO_RSA_ENCRYPT | ALGO_RSA_SIGN) {
+    if !matches!(
+        algo,
+        ALGO_RSA | ALGO_RSA_ENCRYPT | ALGO_RSA_SIGN | ALGO_ECDSA | ALGO_EDDSA
+    ) {
         return Err(Error::new(format!(
-            "public key uses {}, which RPF cannot verify yet (RSA only)",
+            "public key uses {}, which RPF cannot verify (RSA, Ed25519 and NIST P-256 only)",
             key_algo_name(algo)
         )));
     }
-    let values = mpis(&body[6..])?;
-    if values.len() < 2 {
-        return Err(Error::new("RSA public key is missing its modulus or exponent"));
-    }
+    let (n, e, curve) = match algo {
+        ALGO_EDDSA | ALGO_ECDSA => {
+            // Curve keys carry a length-prefixed OID rather than an MPI.
+            if body.len() < 7 {
+                return Err(Error::new("curve public key is missing its curve OID"));
+            }
+            let oid_len = body[6] as usize;
+            if body.len() < 7 + oid_len {
+                return Err(Error::new("curve public key has a truncated OID"));
+            }
+            let oid = &body[7..7 + oid_len];
+            let expected = if algo == ALGO_EDDSA {
+                OID_ED25519
+            } else {
+                OID_NIST_P256
+            };
+            if oid != expected {
+                return Err(Error::new(format!(
+                    "{} key uses curve OID {}, which RPF cannot verify ({} only)",
+                    key_algo_name(algo),
+                    hex_oid(oid),
+                    if algo == ALGO_EDDSA {
+                        "Ed25519"
+                    } else {
+                        "NIST P-256"
+                    }
+                )));
+            }
+            let values = mpis(&body[7 + oid_len..])?;
+            let point = values
+                .first()
+                .ok_or_else(|| Error::new("curve public key is missing its point"))?;
+            if algo == ALGO_EDDSA {
+                let point = strip_point_prefix(point, 0x40, 32, "Ed25519")?;
+                (Vec::new(), Vec::new(), Some(CurveKey::Ed25519(point)))
+            } else {
+                // Uncompressed: 0x04 || X || Y.
+                if point.len() != 65 || point[0] != 0x04 {
+                    return Err(Error::new(
+                        "ECDSA public key is not an uncompressed 65-byte point",
+                    ));
+                }
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Some(CurveKey::P256 {
+                        x: point[1..33].to_vec(),
+                        y: point[33..65].to_vec(),
+                    }),
+                )
+            }
+        }
+        _ => {
+            let values = mpis(&body[6..])?;
+            if values.len() < 2 {
+                return Err(Error::new(
+                    "RSA public key is missing its modulus or exponent",
+                ));
+            }
+            (values[0].clone(), values[1].clone(), None)
+        }
+    };
 
     // v4 fingerprint: SHA-1 over 0x99, the two-octet length, then the packet.
     let mut material = Vec::with_capacity(body.len() + 3);
@@ -539,13 +727,14 @@ fn parse_public_key(body: &[u8]) -> Result<PublicKey> {
     key_id_bytes.copy_from_slice(&fingerprint[12..20]);
 
     Ok(PublicKey {
-        n: values[0].clone(),
-        e: values[1].clone(),
+        n,
+        e,
         key_id: u64::from_be_bytes(key_id_bytes),
         fingerprint: digest::hex(&fingerprint),
         user_id: None,
         algo,
         subkey: false,
+        curve,
     })
 }
 

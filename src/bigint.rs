@@ -216,6 +216,213 @@ fn pad(value: &[u32], len: usize) -> Limbs {
     out
 }
 
+/// A prime modulus with Montgomery arithmetic, for elliptic curve work.
+///
+/// Values stay in the ordinary (non-Montgomery) domain at this level: the
+/// conversions happen inside [`Field::mul`] and [`Field::pow`]. That costs a
+/// couple of multiplications per operation but keeps the curve code readable,
+/// and verification is only a few thousand field operations.
+#[derive(Clone)]
+pub struct Field {
+    n: Limbs,
+    n0inv: u32,
+    r2: Limbs,
+    one_mont: Limbs,
+    n_bytes: Vec<u8>,
+}
+
+impl Field {
+    pub fn new(modulus_be: &[u8]) -> Result<Field> {
+        let n = from_be_bytes(modulus_be);
+        if n.first().copied().unwrap_or(0) & 1 == 0 {
+            return Err(Error::new("field modulus must be odd"));
+        }
+        let n0inv = mont_n0inv(n[0]);
+        let r2 = pow2_mod(64 * n.len(), &n);
+        let mut one = vec![0u32; n.len()];
+        one[0] = 1;
+        let one_mont = mont_mul(&one, &r2, &n, n0inv);
+        Ok(Field {
+            n,
+            n0inv,
+            r2,
+            one_mont,
+            n_bytes: modulus_be.to_vec(),
+        })
+    }
+
+    pub fn limbs(&self) -> usize {
+        self.n.len()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.n_bytes.len()
+    }
+
+    pub fn modulus(&self) -> &[u8] {
+        &self.n_bytes
+    }
+
+    /// Big-endian bytes into field elements, zero-extended to full width.
+    pub fn from_be(&self, bytes: &[u8]) -> Limbs {
+        let mut v = from_be_bytes(bytes);
+        v.resize(self.n.len(), 0);
+        v
+    }
+
+    pub fn to_be(&self, v: &Limbs) -> Vec<u8> {
+        to_be_bytes(v, self.n.len() * 4)
+    }
+
+    pub fn zero(&self) -> Limbs {
+        vec![0u32; self.n.len()]
+    }
+
+    pub fn one(&self) -> Limbs {
+        let mut v = self.zero();
+        v[0] = 1;
+        v
+    }
+
+    pub fn from_u32(&self, value: u32) -> Limbs {
+        let mut v = self.zero();
+        v[0] = value;
+        v
+    }
+
+    pub fn is_zero(&self, a: &[u32]) -> bool {
+        a.iter().all(|l| *l == 0)
+    }
+
+    pub fn eq(&self, a: &[u32], b: &[u32]) -> bool {
+        cmp(&self.fit(a), &self.fit(b)) == std::cmp::Ordering::Equal
+    }
+
+    pub fn is_odd(&self, a: &[u32]) -> bool {
+        a.first().copied().unwrap_or(0) & 1 == 1
+    }
+
+    fn fit(&self, a: &[u32]) -> Limbs {
+        let mut v = a.to_vec();
+        v.resize(self.n.len(), 0);
+        v
+    }
+
+    pub fn add(&self, a: &[u32], b: &[u32]) -> Limbs {
+        let a = self.fit(a);
+        let b = self.fit(b);
+        // One spare limb keeps the carry, which matters when the modulus has
+        // its top bit set (every NIST prime does).
+        let mut wide = vec![0u32; self.n.len() + 1];
+        let mut carry = 0u64;
+        for i in 0..a.len() {
+            let sum = a[i] as u64 + b[i] as u64 + carry;
+            wide[i] = sum as u32;
+            carry = sum >> 32;
+        }
+        wide[a.len()] = carry as u32;
+        self.reduce_wide(wide)
+    }
+
+    pub fn sub(&self, a: &[u32], b: &[u32]) -> Limbs {
+        let a = self.fit(a);
+        let b = self.fit(b);
+        let mut wide = vec![0u32; self.n.len() + 1];
+        wide[..a.len()].copy_from_slice(&a);
+        let mut n_wide = self.n.clone();
+        n_wide.push(0);
+        // a - b + n, which is in [0, 2n) because both inputs are reduced.
+        add_assign(&mut wide, &n_wide);
+        sub_assign(&mut wide, &b);
+        self.reduce_wide(wide)
+    }
+
+    /// Bring a value below `2n` back into `[0, n)` and to the modulus width.
+    fn reduce_wide(&self, mut wide: Limbs) -> Limbs {
+        let mut n_wide = self.n.clone();
+        n_wide.resize(wide.len(), 0);
+        if cmp(&wide, &n_wide) != std::cmp::Ordering::Less {
+            sub_assign(&mut wide, &n_wide);
+        }
+        wide.truncate(self.n.len());
+        wide
+    }
+
+    pub fn mul(&self, a: &[u32], b: &[u32]) -> Limbs {
+        let a_m = self.to_mont(a);
+        let b_m = self.to_mont(b);
+        let product = mont_mul(&a_m, &b_m, &self.n, self.n0inv);
+        self.from_mont(&product)
+    }
+
+    pub fn square(&self, a: &[u32]) -> Limbs {
+        let a_m = self.to_mont(a);
+        let squared = mont_mul(&a_m, &a_m, &self.n, self.n0inv);
+        self.from_mont(&squared)
+    }
+
+    fn to_mont(&self, a: &[u32]) -> Limbs {
+        let a = self.fit(a);
+        mont_mul(&a, &self.r2, &self.n, self.n0inv)
+    }
+
+    fn from_mont(&self, a: &[u32]) -> Limbs {
+        // Reducing by R^-1 means multiplying by 1 in the Montgomery domain's
+        // ordinary representation, *not* by `one_mont` (which is R itself).
+        let one = self.one();
+        mont_mul(&self.fit(a), &one, &self.n, self.n0inv)
+    }
+
+    /// `a^exponent`, with the exponent as big-endian bytes.
+    pub fn pow(&self, a: &[u32], exponent: &[u8]) -> Limbs {
+        // Work entirely in the Montgomery domain: one conversion in, one out.
+        let base = self.to_mont(a);
+        let mut acc = self.one_mont.clone();
+        let mut started = false;
+        for byte in exponent {
+            for bit in (0..8).rev() {
+                if started {
+                    acc = mont_mul(&acc, &acc.clone(), &self.n, self.n0inv);
+                }
+                if (byte >> bit) & 1 == 1 {
+                    acc = mont_mul(&acc, &base, &self.n, self.n0inv);
+                    started = true;
+                }
+            }
+        }
+        self.from_mont(&acc)
+    }
+
+    /// Modular inverse by Fermat's little theorem, valid for prime moduli.
+    pub fn inv(&self, a: &[u32]) -> Result<Limbs> {
+        if self.is_zero(a) {
+            return Err(Error::new("cannot invert zero"));
+        }
+        // n - 2
+        let mut exponent = self.n_bytes.clone();
+        let mut borrow = 2u16;
+        for byte in exponent.iter_mut().rev() {
+            let value = *byte as u16;
+            if value >= borrow {
+                *byte = (value - borrow) as u8;
+                break;
+            }
+            *byte = (value + 256 - borrow) as u8;
+            borrow = 1;
+        }
+        Ok(self.pow(a, &exponent))
+    }
+}
+
+fn add_assign(a: &mut [u32], b: &[u32]) {
+    let mut carry = 0u64;
+    for i in 0..a.len() {
+        let sum = a[i] as u64 + b.get(i).copied().unwrap_or(0) as u64 + carry;
+        a[i] = sum as u32;
+        carry = sum >> 32;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
