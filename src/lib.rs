@@ -12,6 +12,7 @@ pub mod digest;
 pub mod error;
 pub mod fetch;
 pub mod ini;
+pub mod install;
 pub mod pkg;
 pub mod repomd;
 pub mod rpm;

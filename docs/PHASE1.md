@@ -63,6 +63,33 @@ dependency that does not name one ("`foo >= 1.0`" matches `1.0-99.fc43`).
   before the package enters the transaction. A previously cached file that fails
   its checksum is deleted and re-downloaded.
 
+### Installation and removal
+* RPM format fully parsed: lead, signature header (8-byte aligned), main header
+  and cpio `newc` payload, with all v3/v4 tag semantics (`FILEMODES`,
+  `FILEDIGESTS`, `FILEFLAGS`, `BASENAMES`/`DIRNAMES`/`DIRINDEXES`,
+  `PAYLOADDIGEST`, `PAYLOADDIGESTALT`).
+* Payload integrity is checked before anything is written: the digest covers the
+  bytes exactly as stored in the file, and `PAYLOADDIGESTALT` covers the
+  decompressed stream, so a payload that has been re-compressed after tampering
+  is still caught.
+* Extraction into `--installroot`: directories, regular files, symlinks,
+  hardlinks (deduplicated by payload inode number), modes and mtimes preserved;
+  ownership applied when running as root. `%ghost` files are recorded but not
+  created. Paths escaping the install root are refused, as are absolute symlink
+  targets that resolve outside it.
+* `%config` handling: `(noreplace)` keeps the local file and writes `.rpmnew`;
+  a plain `%config` is replaced and the original is kept as `.rpmsave`.
+* File conflicts are detected before the transaction starts; conflicting paths
+  make the whole transaction fail without touching the system. `--replacefiles`
+  overrides this deliberately.
+* Dependencies are installed before dependants, obsoleted packages are removed
+  first, and `--test` prints the transaction without writing anything.
+* `remove` deletes the files in the database manifest, prunes directories it
+  emptied, and refuses when another installed package requires what is being
+  removed.
+* The installed database records each package's dependency data, so those
+  safety checks still work in later invocations.
+
 ### Storage
 A custom binary cache (`packages.rpf` + `meta` per repository) written
 atomically. No SQLite dependency: the format is length-prefixed and loads in a
@@ -73,9 +100,9 @@ so a hostile id cannot escape the cache directory.
 
 | Area | Why it is deferred |
 |---|---|
-| **Filesystem installation** | Needs the RPM header parser, cpio payload extraction, scriptlet execution and file conflict handling. Next milestone; `install` plans and downloads only. |
-| **GPG signature verification** | RPM signatures live inside the RPM's signature header, so this lands together with the header parser. Downloads are currently checksum-verified only, and RPF says so on stderr. |
-| **rpmdb interoperability** | Writing rpm's SQLite database is out of scope for now. RPF keeps `installed.rpf` and reads `rpm -qa` as a fallback so it can reason about an existing system. |
+| **Scriptlet macro expansion** | `%pre`/`%post`/`%preun`/`%postun` are executed through `/bin/sh` (through `chroot` for an `--installroot`) and receive rpm's `$1` argument. Bodies that contain `%{...}` macros are not expanded yet, and scriptlets are skipped with a warning when RPF is not root. |
+| **GPG signature verification** | RPM signatures live inside the RPM's signature header and are parsed, but OpenPGP packet decoding, RSA/EdDSA verification and key import from `gpgkey=` are still to come. Downloads are checksum-verified only, and RPF says so on stderr. |
+| **rpmdb interoperability** | Writing rpm's SQLite database is out of scope for now. RPF keeps `installed.rpf` (now including dependency records) and reads `rpm -qa` as a fallback so it can reason about an existing system. |
 | **`filelists.xml` / `other.xml`** | Only `primary.xml` is parsed. Full file queries (`rpf provides /usr/bin/foo` for non-primary files) need filelists, which is a phase 1.x item. |
 | **Modules, comps groups, delta RPMs, `--downloadonly` semantics** | Not part of the foundation. |
 | **Parallel downloads** | Downloads are sequential per package. `max_parallel_downloads` is parsed but not yet acted on. |
@@ -98,25 +125,31 @@ accident.
   `makecache`, `list`, `search`, `info`, `provides`, `download`, `clean`,
   `copr enable/remove`, cache-only failures, corrupt checksums and unsatisfiable
   dependencies all assert on real process output and exit codes.
+* **Installation tests** (`tests/install.rs`) — `tests/common` writes genuine
+  RPM files (lead, headers, cpio payload, optionally gzip-compressed) and a
+  matching repository, so the tests cover the whole pipeline rather than a mock:
+  install from a repository, dependency pull-in and ordering, `%config` vs
+  `%config(noreplace)` behaviour, symlinks and hardlinks (inode equality),
+  conflicting paths, tampered payloads, `--test`, removal, directory pruning and
+  refusal to remove a package that another one requires.
+* The real `basic-gzip.rpm` fixture is also installed into a scratch
+  `--installroot` and compared file by file.
 
-`cargo test` runs 94 tests: 75 library unit tests, 4 CLI unit tests, 15
-end-to-end tests.
+`cargo test` runs 127 tests: 94 library unit tests, 4 CLI unit tests, 14
+installation tests and 15 end-to-end tests.
 
 ## Next steps
 
-1. **RPM header parser** — lead, signature header, main header, tag model
-   (NEVRA, provides/requires, file list, payload digest, payload compactor).
-2. **Payload extraction** — `newc` cpio, decompression per payload compactor,
-   install into `--installroot` with mode/ownership/symlink handling.
-3. **Transaction execution** — file conflict detection, scriptlets, atomic
-   rollback on failure, then `remove`.
-4. **GPG verification** — signature header extraction and OpenPGP verification
-   of the package plus `repo_gpgcheck` for `repomd.xml`.
-5. **rpmdb** — read the existing database, then write to it so RPF and rpm agree
-   on what is installed.
-6. **Polish** — parallel downloads, progress output, `filelists` for file
+1. **GPG verification** — OpenPGP packet decoding, RSA and Ed25519 signature
+   verification of the signed header, key import from `gpgkey=`, and
+   `repo_gpgcheck` over `repomd.xml`.
+2. **Scriptlet execution** — macro expansion and `chroot` execution inside the
+   install root, which removes the last `--noscripts` caveat.
+3. **rpmdb** — write rpm's own database so RPF and rpm agree on what is
+   installed, or document the incompatibility as a deliberate choice.
+4. **Polish** — parallel downloads, progress output, `filelists` for file
    queries, shell completion.
 
-Phase 2 (feature parity and beyond) starts only once 1–5 are done and the
+Phase 2 (feature parity and beyond) starts only once 1–3 are done and the
 foundation installs, upgrades and removes packages cleanly on a real Fedora
 system.

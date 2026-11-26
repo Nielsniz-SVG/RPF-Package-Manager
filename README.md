@@ -27,9 +27,10 @@ in the process. That means no supply chain to audit beyond `std`, and a binary
 that is 800 KB instead of 20 MB.
 
 **Verify before you trust.** Repository metadata is checked against the
-checksums in `repomd.xml` (both the compressed and the decompressed form), and
-every downloaded RPM is checked against the checksum in the repository metadata
-before it is used. A failed check aborts the transaction; nothing is written on
+checksums in `repomd.xml` (both the compressed and the decompressed form), every
+downloaded RPM is checked against the checksum in the repository metadata, and
+each package's own header and payload digests are verified again immediately
+before extraction. A failed check aborts the transaction; nothing is written on
 a mismatch.
 
 **Say what you know and what you don't.** Where a piece is not implemented yet,
@@ -38,9 +39,11 @@ RPF refuses and tells you, rather than silently doing half the job. See
 
 ## Status
 
-Milestone 1 (this commit) is the metadata, resolution and download
-foundation. It is complete and tested end to end. Filesystem installation is
-the remaining piece of the foundation.
+Milestone 1 is the metadata, resolution, download and transaction foundation.
+Installing and removing packages on disk works and is tested end to end. What
+remains before the foundation is finished is cryptographic signature
+verification and scriptlets — see the table below and
+[`docs/PHASE1.md`](docs/PHASE1.md).
 
 | Capability | State |
 |---|---|
@@ -55,21 +58,26 @@ the remaining piece of the foundation.
 | COPR enable / remove / list | **Working** |
 | Package download into the cache | **Working** |
 | `list`, `search`, `info`, `provides`, `repoquery`, `repolist` | **Working** |
+| RPM header and cpio payload parsing | **Working** |
+| Installing packages to disk (`--installroot` supported) | **Working** |
+| `%config` / `%config(noreplace)` → `.rpmnew` / `.rpmsave` | **Working** |
+| Symlinks, hardlinks, modes, mtimes, `%ghost` entries | **Working** |
+| File conflict detection before the transaction | **Working** |
+| `remove`, directory pruning, "required by" protection | **Working** |
+| `--test`, `--nodeps`, `--replacefiles` | **Working** |
 | GPG signature verification of RPMs | **Not yet** — checksums only |
-| Installing to the filesystem, `%post` scripts, admin files | **Not yet** — next milestone |
-| `remove` writing to disk | **Not yet** — next milestone |
-| Reading/writing the real rpmdb | **Not yet** — uses its own DB for now |
+| Scriptlet execution (`%pre`/`%post`/`%preun`/`%postun`) | **Partial** — run through `/bin/sh`, `chroot` inside `--installroot`, with rpm's `$1` argument; RPM macro expansion is not implemented |
+| Reading/writing the real rpmdb | **Not yet** — uses its own DB, reads `rpm -qa` as fallback |
 
-`rpf install` currently resolves the whole transaction, downloads and verifies
-every package, then stops and exits non-zero with an explanation instead of
-pretending the system was updated. `rpf download` gives you the verified
-packages without the install step.
+Scriptlets that use RPM macros (`%{_bindir}`, `%{_sysconfdir}`, ...) will not
+expand yet, and they only run when RPF has root; when they are skipped, `rpf`
+says so on stderr instead of staying quiet.
 
 ## Build
 
 ```sh
 cargo build --release      # -> target/release/rpf
-cargo test                 # 94 tests: unit + end-to-end
+cargo test                 # 127 tests: unit, end-to-end, installation
 ```
 
 Requirements: a Rust toolchain (1.70+). At runtime on Fedora, RPF uses `curl`
@@ -86,7 +94,8 @@ rpf info firefox                      # details for a package
 rpf provides /bin/sh                  # who provides a file or capability
 rpf list --installed                  # installed packages
 rpf download firefox                  # resolve + download + verify
-rpf install htop                      # resolve + download (see Status)
+rpf install htop                      # resolve, download, verify, install
+rpf install ./some-package.rpm        # local package file
 rpf copr enable user/project          # add a COPR repository
 rpf clean all                         # drop caches
 ```

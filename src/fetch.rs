@@ -200,6 +200,8 @@ pub enum Compression {
     Gzip,
     Xz,
     Zstd,
+    Bzip2,
+    Lzma,
 }
 
 impl Compression {
@@ -211,6 +213,10 @@ impl Compression {
             Compression::Xz
         } else if lower.ends_with(".zst") || lower.ends_with(".zstd") {
             Compression::Zstd
+        } else if lower.ends_with(".bz2") {
+            Compression::Bzip2
+        } else if lower.ends_with(".lzma") {
+            Compression::Lzma
         } else {
             Compression::None
         }
@@ -222,6 +228,8 @@ impl Compression {
             Compression::Gzip => Some(("gzip", &["-dc"])),
             Compression::Xz => Some(("xz", &["-dc"])),
             Compression::Zstd => Some(("zstd", &["-dc"])),
+            Compression::Bzip2 => Some(("bzip2", &["-dc"])),
+            Compression::Lzma => Some(("xz", &["--format=lzma", "-dc"])),
         }
     }
 }

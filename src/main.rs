@@ -4,9 +4,12 @@ use rpf::cache::{self, CachedRepo};
 use rpf::config::{Config, Overrides};
 use rpf::db::InstalledDb;
 use rpf::fetch;
+use rpf::install as installer;
+use rpf::rpm::Rpm;
 use rpf::pkg::Package;
 use rpf::solver::{Resolution, Resolver, SolverOptions};
 use rpf::{digest, Error, Result};
+use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +28,7 @@ Package queries:
 
 Transactions:
   install SPEC...            Resolve, download and install packages
+  install ./FILE.rpm         Install a local package (dependencies resolved)
   download SPEC...           Resolve and download packages into the cache
   remove PACKAGE...          Remove installed packages
   copr enable OWNER/PROJECT  Add a COPR repository
@@ -47,6 +51,10 @@ Global options:
       --disablerepo=ID       Disable a repository
       --repo=ID              Limit operations to a repository
       --nogpgcheck           Skip GPG signature checks
+      --test                 Plan the transaction without touching the system
+      --noscripts            Do not run any package scriptlets
+      --replacefiles         Allow packages to overwrite conflicting files
+      --nodeps               Do not resolve dependencies
   -q, --quiet                Reduce output
   -v, --verbose              More output
   -h, --help                 Show this help
@@ -64,6 +72,10 @@ struct Args {
     verbose: bool,
     repo_filter: Vec<String>,
     list_mode: ListMode,
+    test: bool,
+    noscripts: bool,
+    replacefiles: bool,
+    nodeps: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +180,10 @@ fn parse_args(argv: &[String]) -> Result<Args> {
             "-v" | "--verbose" => args.verbose = true,
             "--nogpgcheck" => args.overrides.no_gpgcheck = true,
             "--best" => args.overrides.best = true,
+            "--test" => args.test = true,
+            "--noscripts" => args.noscripts = true,
+            "--replacefiles" => args.replacefiles = true,
+            "--nodeps" => args.nodeps = true,
             "--releasever" => args.overrides.releasever = Some(value!()),
             "--installroot" => args.overrides.installroot = Some(PathBuf::from(value!())),
             "--cachedir" => args.overrides.cachedir = Some(PathBuf::from(value!())),
@@ -544,6 +560,10 @@ fn cmd_download(args: &Args) -> Result<i32> {
     std::fs::create_dir_all(&dir).map_err(|e| Error::new(format!("{}: {}", dir.display(), e)))?;
 
     for pkg in &resolution.install {
+        if pkg.repo == "@commandline" {
+            println!("  {} (local file, not downloaded)", pkg.location);
+            continue;
+        }
         let path = download_package(&config, pkg, &dir)?;
         println!("  {}", path.display());
     }
@@ -555,11 +575,57 @@ fn cmd_install(args: &Args) -> Result<i32> {
         return Err(Error::new("install requires at least one package"));
     }
     let config = load_config(args)?;
-    let caches = load_metadata(&config, args)?;
-    let available = available_packages(&caches);
+
+    // Split the request into local .rpm files and repository specs.
+    let mut local: HashMap<String, PathBuf> = HashMap::new();
+    let mut specs: Vec<String> = Vec::new();
+    for arg in &args.rest {
+        let looks_like_file = arg.ends_with(".rpm") || arg.starts_with('/') || arg.starts_with("./");
+        if looks_like_file {
+            let path = PathBuf::from(arg);
+            if !path.exists() {
+                return Err(Error::new(format!("no such file: {}", path.display())));
+            }
+            let rpm = Rpm::open(&path)?;
+            let mut pkg = rpm.package();
+            if pkg.name.is_empty() {
+                return Err(Error::new(format!(
+                    "{}: package has no name in its header",
+                    path.display()
+                )));
+            }
+            let absolute = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            pkg.repo = "@commandline".to_string();
+            pkg.location = absolute.display().to_string();
+            pkg.download_size = std::fs::metadata(&absolute).map(|m| m.len()).unwrap_or(0);
+            local.insert(pkg.nevra(), absolute);
+            specs.push(pkg.nevra());
+        } else {
+            specs.push(arg.clone());
+        }
+    }
+
+    // Repository metadata is only required for dependencies. When every
+    // request is a local file and the repositories are unreachable, resolve
+    // against what we have instead of failing outright.
+    let all_local = specs
+        .iter()
+        .all(|spec| available_local_spec(&local, spec));
+    let caches = match load_metadata(&config, args) {
+        Ok(c) => c,
+        Err(e) if all_local => {
+            eprintln!("warning: repository metadata unavailable ({}); resolving local packages only", e);
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let mut available = available_packages(&caches);
+    for pkg in local_rpm_packages(&local)? {
+        available.push(pkg);
+    }
     let installed = installed_packages(&config);
 
-    let resolution = resolve(&config, available, installed, &args.rest);
+    let resolution = resolve_with(&config, available, installed, &specs, args.nodeps);
     report_resolution(&resolution);
     if !resolution.is_ok() {
         return Ok(1);
@@ -569,35 +635,95 @@ fn cmd_install(args: &Args) -> Result<i32> {
         return Ok(0);
     }
 
-    // Download and verify everything first, so a failure never leaves the
-    // system half-updated.
+    if config.conf.installroot == Path::new("/") && !installer::is_root() && !args.test {
+        return Err(Error::new(
+            "installing to / requires root; use --installroot to install elsewhere",
+        ));
+    }
+
+    if args.test {
+        println!("Test mode: no changes were made.");
+        return Ok(0);
+    }
+
+    // Fetch every non-local package and verify it before touching the system.
     let dir = config.conf.cachedir.join("packages");
     std::fs::create_dir_all(&dir).map_err(|e| Error::new(format!("{}: {}", dir.display(), e)))?;
-    if !args.quiet {
-        println!("Downloading packages:");
+    if !args.quiet && resolution.install.iter().any(|p| !local.contains_key(&p.nevra())) {
+        println!("\nDownloading packages:");
     }
-    let mut paths = Vec::new();
     for pkg in &resolution.install {
-        let path = download_package(&config, pkg, &dir)?;
+        if local.contains_key(&pkg.nevra()) {
+            continue;
+        }
+        download_package(&config, pkg, &dir)?;
         if !args.quiet {
             println!("  {}  ({})", pkg.nevra(), human_size(pkg.download_size));
         }
-        paths.push(path);
     }
 
-    // Filesystem installation requires the RPM header parser and cpio payload
-    // extraction, which is the next milestone (see docs/PHASE1.md).
+    // Remove obsoleted packages first, then install in dependency order.
+    let opts = installer::Options {
+        installroot: config.conf.installroot.clone(),
+        test: args.test,
+        noscripts: args.noscripts,
+        verbose: args.verbose,
+        replacefiles: args.replacefiles,
+    };
+
+    if !resolution.remove.is_empty() {
+        let names: Vec<String> = resolution.remove.iter().map(|p| p.name.clone()).collect();
+        installer::remove(&config, &names, &opts)?;
+        for pkg in &resolution.remove {
+            println!("  removed  {}", pkg.nevra());
+        }
+    }
+
+    let report = installer::install(&config, &resolution.install, &local, &opts)?;
+
     println!();
-    println!(
-        "Prepared {} package(s) in {}",
-        paths.len(),
-        dir.display()
-    );
-    println!(
-        "Filesystem installation is not enabled in this build yet; \
-         use 'rpf download' to fetch packages or see docs/PHASE1.md for status."
-    );
-    Ok(1)
+    for pkg in &report.installed {
+        println!("  Complete! {}", pkg.nevra());
+    }
+    if report.installed.is_empty() {
+        println!("Nothing to do.");
+    } else {
+        println!(
+            "Installed {} package(s), {} file(s), {} written.",
+            report.installed.len(),
+            report.files_written,
+            human_size(report.bytes_written)
+        );
+    }
+    for path in &report.rpmnew {
+        println!("  saved new config as {}", path);
+    }
+    for path in &report.rpmsave {
+        println!("  saved original config as {}", path);
+    }
+    for warning in &report.warnings {
+        eprintln!("warning: {}", warning);
+    }
+    Ok(0)
+}
+
+fn available_local_spec(local: &HashMap<String, PathBuf>, spec: &str) -> bool {
+    local.keys().any(|k| k == spec)
+}
+
+/// Parse the local `.rpm` files listed on the command line into packages.
+fn local_rpm_packages(local: &HashMap<String, PathBuf>) -> Result<Vec<Package>> {
+    let mut out = Vec::new();
+    for (nevra, path) in local {
+        let rpm = Rpm::open(path)?;
+        let mut pkg = rpm.package();
+        pkg.repo = "@commandline".to_string();
+        pkg.location = path.display().to_string();
+        pkg.download_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        debug_assert_eq!(&pkg.nevra(), nevra);
+        out.push(pkg);
+    }
+    Ok(out)
 }
 
 fn cmd_remove(args: &Args) -> Result<i32> {
@@ -606,10 +732,12 @@ fn cmd_remove(args: &Args) -> Result<i32> {
     }
     let config = load_config(args)?;
     let db = InstalledDb::load(&config.conf.dbpath)?;
+
     let mut missing = Vec::new();
+    let mut present = Vec::new();
     for name in &args.rest {
         if db.is_installed(name) {
-            println!("Would remove: {}", name);
+            present.push(name.clone());
         } else {
             missing.push(name.clone());
         }
@@ -620,9 +748,39 @@ fn cmd_remove(args: &Args) -> Result<i32> {
             missing.join(", ")
         )));
     }
+
+    if config.conf.installroot == Path::new("/") && !installer::is_root() && !args.test {
+        return Err(Error::new(
+            "removing from / requires root; use --installroot to operate elsewhere",
+        ));
+    }
+
+    let opts = installer::Options {
+        installroot: config.conf.installroot.clone(),
+        test: args.test,
+        noscripts: args.noscripts,
+        verbose: args.verbose,
+        replacefiles: false,
+    };
+
+    if args.test {
+        for name in &present {
+            println!("Would remove: {}", name);
+        }
+        println!("Test mode: no changes were made.");
+        return Ok(0);
+    }
+
+    let report = installer::remove(&config, &present, &opts)?;
+    for pkg in &report.removed {
+        println!("  removed  {}", pkg.nevra());
+    }
     println!();
-    println!("Filesystem removal is not enabled in this build yet (see docs/PHASE1.md).");
-    Ok(1)
+    println!("Removed {} package(s).", report.removed.len());
+    for warning in &report.warnings {
+        eprintln!("warning: {}", warning);
+    }
+    Ok(0)
 }
 
 fn cmd_clean(args: &Args) -> Result<i32> {
@@ -686,6 +844,16 @@ fn resolve(
     installed: Vec<Package>,
     specs: &[String],
 ) -> Resolution {
+    resolve_with(config, available, installed, specs, false)
+}
+
+fn resolve_with(
+    config: &Config,
+    available: Vec<Package>,
+    installed: Vec<Package>,
+    specs: &[String],
+    nodeps: bool,
+) -> Resolution {
     let prefs: Vec<(String, i32, i32)> = config
         .repos
         .iter()
@@ -699,6 +867,7 @@ fn resolve(
         arches,
         best: config.conf.best,
         install_weak_deps: false,
+        ignore_deps: nodeps,
     };
     Resolver::new(available, installed, opts)
         .with_repo_prefs(&prefs)

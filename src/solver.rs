@@ -27,6 +27,8 @@ pub struct SolverOptions {
     pub best: bool,
     /// Weak dependencies (Recommends/Suggests) are resolved when harmless.
     pub install_weak_deps: bool,
+    /// Skip requirement traversal entirely (`--nodeps`).
+    pub ignore_deps: bool,
 }
 
 impl Default for SolverOptions {
@@ -35,6 +37,7 @@ impl Default for SolverOptions {
             arches: vec!["x86_64".to_string(), "noarch".to_string()],
             best: true,
             install_weak_deps: false,
+            ignore_deps: false,
         }
     }
 }
@@ -154,6 +157,9 @@ impl Resolver {
             }
             if let Err(reason) = self.select(idx) {
                 self.problems.push(reason);
+                continue;
+            }
+            if self.opts.ignore_deps {
                 continue;
             }
             let pkg = &self.available[idx];

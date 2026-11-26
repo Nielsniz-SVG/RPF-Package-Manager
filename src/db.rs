@@ -10,10 +10,17 @@
 //!
 //! ```text
 //! pkg<TAB>name<TAB>epoch<TAB>version<TAB>release<TAB>arch<TAB>install_time<TAB>repo
+//! dep<TAB>pkg-nevra<TAB>kind<TAB>name<TAB>flags<TAB>evr
 //! file<TAB>path<TAB>size<TAB>mode<TAB>pkg-nevra
 //! ```
+//!
+//! `kind` is one of `R` (requires), `P` (provides), `C` (conflicts) or
+//! `O` (obsoletes). Dependency records are what make `rpf remove` able to
+//! refuse to break other packages.
 
+use crate::deps::{Depend, DepFlags};
 use crate::pkg::Package;
+use crate::version::Evr;
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::fs;
@@ -49,12 +56,34 @@ impl InstalledDb {
             Err(e) => return Err(Error::new(format!("{}: {}", path.display(), e))),
         };
 
+        let mut pending_deps: Vec<(String, char, Depend)> = Vec::new();
+
         for line in text.lines() {
             if line.starts_with('#') || line.trim().is_empty() {
                 continue;
             }
             let fields: Vec<&str> = line.split('\t').collect();
             match fields.first().copied() {
+                Some("dep") if fields.len() >= 6 => {
+                    let nevra = fields[1].to_string();
+                    let kind = fields[2].chars().next().unwrap_or('R');
+                    let flags = DepFlags(fields[4].parse::<u8>().unwrap_or(0));
+                    let evr = if fields[5].is_empty() {
+                        None
+                    } else {
+                        Some(Evr::parse(fields[5]))
+                    };
+                    pending_deps.push((
+                        nevra,
+                        kind,
+                        Depend {
+                            name: fields[3].to_string(),
+                            flags,
+                            evr,
+                            rich: None,
+                        },
+                    ));
+                }
                 Some("pkg") if fields.len() >= 8 => {
                     let pkg = Package {
                         name: fields[1].to_string(),
@@ -83,6 +112,18 @@ impl InstalledDb {
                 _ => {}
             }
         }
+
+        // Attach dependency records now that every package is loaded.
+        for (nevra, kind, depend) in pending_deps {
+            if let Some(pkg) = db.packages.iter_mut().find(|p| p.nevra() == nevra) {
+                match kind {
+                    'P' => pkg.provides.push(depend),
+                    'C' => pkg.conflicts.push(depend),
+                    'O' => pkg.obsoletes.push(depend),
+                    _ => pkg.requires.push(depend),
+                }
+            }
+        }
         Ok(db)
     }
 
@@ -96,6 +137,26 @@ impl InstalledDb {
                 "pkg\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 pkg.name, pkg.epoch, pkg.version, pkg.release, pkg.arch, time, pkg.repo
             ));
+            for (kind, deps) in [
+                ('P', &pkg.provides),
+                ('R', &pkg.requires),
+                ('C', &pkg.conflicts),
+                ('O', &pkg.obsoletes),
+            ] {
+                for dep in deps {
+                    out.push_str(&format!(
+                        "dep\t{}\t{}\t{}\t{}\t{}\n",
+                        pkg.nevra(),
+                        kind,
+                        dep.name,
+                        dep.flags.bits(),
+                        dep.evr
+                            .as_ref()
+                            .map(|e| e.to_string_full())
+                            .unwrap_or_default()
+                    ));
+                }
+            }
             if let Some(files) = self.files.get(&pkg.nevra()) {
                 for f in files {
                     out.push_str(&format!(
@@ -291,6 +352,34 @@ mod tests {
         db.add(pkg("bash", "5.3.0"), vec![], 2);
         assert_eq!(db.packages.len(), 1);
         assert_eq!(db.packages[0].version, "5.3.0");
+    }
+
+    #[test]
+    fn dependencies_survive_a_roundtrip() {
+        let dir = tmpdir("deps");
+        let mut db = InstalledDb::default();
+        let mut pkg = pkg("app", "1.0");
+        pkg.requires.push(Depend::versioned(
+            "glibc",
+            DepFlags::GE,
+            Evr::parse("2.38"),
+        ));
+        pkg.requires.push(Depend::simple("/bin/sh"));
+        pkg.provides.push(Depend::simple("webclient"));
+        db.add(pkg, vec![], 1);
+        db.save(&dir).unwrap();
+
+        let loaded = InstalledDb::load(&dir).unwrap();
+        let app = loaded.get("app").unwrap();
+        assert_eq!(app.requires.len(), 2, "requires must be persisted");
+        assert_eq!(app.requires[0].name, "glibc");
+        assert_eq!(app.requires[0].flags, DepFlags::GE);
+        assert_eq!(
+            app.requires[0].evr.as_ref().unwrap().version,
+            "2.38"
+        );
+        assert_eq!(app.provides.len(), 1);
+        assert_eq!(app.provides[0].name, "webclient");
     }
 
     #[test]
