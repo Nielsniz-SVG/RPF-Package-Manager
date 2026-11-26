@@ -568,3 +568,135 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// rpmdb interoperability
+// ---------------------------------------------------------------------------
+
+/// Install a stand-in `rpm` binary that reports the given `--xml` output.
+fn fake_rpm(dir: &std::path::Path, xml: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("rpm");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\ncat <<'RPF_FAKE_RPM_EOF'\n{}\nRPF_FAKE_RPM_EOF\n", xml),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+}
+
+fn run_with_path(
+    fixture: &RepoFixture,
+    path_prefix: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let root = fixture.ensure_installroot();
+    let mut full: Vec<String> = vec![
+        "--installroot".to_string(),
+        root.display().to_string(),
+    ];
+    full.extend(args.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+    let path = format!(
+        "{}:{}",
+        path_prefix.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    std::process::Command::new(env!("CARGO_BIN_EXE_rpf"))
+        .args(&refs)
+        .env("PATH", path)
+        .env("RPF_REPOSDIR", fixture.path("repos.d"))
+        .env("RPF_RELEASEVER", "41")
+        .env("RPF_BASEARCH", "x86_64")
+        .env_remove("RPF_CACHEDIR")
+        .env_remove("RPF_DBPATH")
+        .env_remove("RPF_INSTALLROOT")
+        .output()
+        .expect("failed to run rpf")
+}
+
+const SYSTEM_GLIBC_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rpmHeader>
+<rpmPackage>
+<name>glibc</name>
+<version epoch="0" ver="2.40" rel="3.fc41"/>
+<arch>x86_64</arch>
+<summary>The GNU C Library</summary>
+<format>
+<rpm:provides>
+<rpm:entry name="glibc" flags="EQ" epoch="0" ver="2.40" rel="3.fc41"/>
+<rpm:entry name="libc.so.6()(64bit)"/>
+</rpm:provides>
+<rpm:requires/>
+<file>/usr/lib64/libc.so.6</file>
+</format>
+</rpmPackage>
+</rpmHeader>"#;
+
+#[test]
+fn resolves_against_the_system_rpmdb() {
+    let fx = RepoFixture::new("rpmdb-resolve");
+    fx.publish(&[PkgSpec::new("needsglibc", "1.0")
+        .with_file(FileSpec::new("/usr/bin/needsglibc", "x\n"))
+        .with_requires("libc.so.6()(64bit)")]);
+
+    let bin = fx.path("fakebin");
+    fake_rpm(&bin, SYSTEM_GLIBC_XML);
+
+    // Without the rpmdb the dependency is unsatisfiable.
+    let out = fx.rpf_root(&["install", "needsglibc"]);
+    assert!(!out.status.success(), "dependency should be missing");
+
+    // With rpm on PATH, the already-installed glibc satisfies it.
+    let out = run_with_path(&fx, &bin, &["install", "needsglibc"]);
+    assert_success(&out, "install with rpmdb");
+    assert!(file_exists(&fx.installroot().join("usr/bin/needsglibc")));
+    assert!(
+        !text(&out).contains("glibc-2.40"),
+        "the system's glibc must not be reinstalled:\n{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn removes_a_package_recorded_only_in_the_rpmdb() {
+    let fx = RepoFixture::new("rpmdb-remove");
+    let root = fx.ensure_installroot();
+
+    // A package the system installed: files exist, RPF's database knows nothing.
+    std::fs::create_dir_all(root.join("usr/bin")).unwrap();
+    std::fs::write(root.join("usr/bin/syspkg"), "system\n").unwrap();
+    std::fs::write(
+        root.join("usr/share/syspkg-data"),
+        "data\n",
+    )
+    .ok();
+
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rpmHeader>
+<rpmPackage>
+<name>syspkg</name>
+<version epoch="0" ver="1.0" rel="1.fc41"/>
+<arch>x86_64</arch>
+<summary>Installed by dnf</summary>
+<format>
+<rpm:provides><rpm:entry name="syspkg" flags="EQ" epoch="0" ver="1.0" rel="1.fc41"/></rpm:provides>
+<rpm:requires/>
+<file>/usr/bin/syspkg</file>
+</format>
+</rpmPackage>
+</rpmHeader>"#;
+    let bin = fx.path("fakebin");
+    fake_rpm(&bin, xml);
+
+    let out = run_with_path(&fx, &bin, &["remove", "syspkg"]);
+    assert_success(&out, "remove rpmdb package");
+    assert!(
+        !file_exists(&root.join("usr/bin/syspkg")),
+        "the file must be removed: {}",
+        text(&out)
+    );
+}

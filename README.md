@@ -96,7 +96,7 @@ the same model `rpm --import` uses.
 
 ```sh
 cargo build --release      # -> target/release/rpf
-cargo test                 # 157 tests: unit, end-to-end, installation
+cargo test                 # 161 tests: unit, end-to-end, installation
 ```
 
 Requirements: a Rust toolchain (1.70+). At runtime on Fedora, RPF uses `curl`

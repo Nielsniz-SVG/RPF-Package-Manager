@@ -851,10 +851,17 @@ fn cmd_remove(args: &Args) -> Result<i32> {
     let config = load_config(args)?;
     let db = InstalledDb::load(&config.conf.dbpath)?;
 
+    // Packages installed by dnf live in the rpmdb, not in RPF's database.
+    let system: Vec<Package> = if args.rest.iter().any(|n| !db.is_installed(n)) {
+        rpf::db::rpmdb_packages(&config.conf.installroot)
+    } else {
+        Vec::new()
+    };
+
     let mut missing = Vec::new();
     let mut present = Vec::new();
     for name in &args.rest {
-        if db.is_installed(name) {
+        if db.is_installed(name) || system.iter().any(|p| &p.name == name) {
             present.push(name.clone());
         } else {
             missing.push(name.clone());

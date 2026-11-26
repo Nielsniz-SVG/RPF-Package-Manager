@@ -2,8 +2,16 @@
 //!
 //! Milestone 1 keeps its own record of installed packages under
 //! `<dbpath>/installed.rpf` rather than writing to the rpmdb (which would mean
-//! reimplementing rpm's SQLite schema from scratch). Interoperating with the
-//! real rpmdb is phase 2 — see `docs/PHASE1.md`.
+//! reimplementing rpm's own on-disk schema from scratch).
+//!
+//! Reading interoperates with the real rpmdb: `rpm -qa --xml --files` gives
+//! name, EVR, architecture, dependencies and file lists in a documented,
+//! stable format, and RPF parses it with its own XML reader. That means a
+//! system populated by dnf is understood well enough to resolve against and to
+//! remove from. Writing the rpmdb is deliberately out of scope: rpm owns those
+//! bytes, and writing them without rpm's own library risks corrupting the
+//! database. Installing with RPF therefore records packages in `installed.rpf`,
+//! which `rpm -qa` will not show.
 //!
 //! Format: a small, line-oriented text file so it can be inspected and
 //! repaired with ordinary tools. Fields are tab separated:
@@ -217,6 +225,152 @@ impl InstalledDb {
 /// Packages installed in the rpmdb of the target root, if `rpm` is available.
 /// Used as a fallback so RPF can reason about a system it did not populate.
 pub fn rpmdb_packages(installroot: &Path) -> Vec<Package> {
+    if let Some((packages, _)) = rpmdb_entries(installroot) {
+        return packages;
+    }
+    rpmdb_packages_flat(installroot)
+}
+
+/// Read packages *and* file manifests from the rpmdb.
+///
+/// Returns `None` when rpm is unavailable or fails, so callers can fall back to
+/// `installed.rpf` alone.
+pub fn rpmdb_entries(installroot: &Path) -> Option<(Vec<Package>, HashMap<String, Vec<FileRecord>>)> {
+    let output = std::process::Command::new("rpm")
+        .arg("--root")
+        .arg(installroot)
+        .args(["-qa", "--xml", "--files"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_rpmdb_xml(&text).ok()?;
+    Some(parsed)
+}
+
+/// Parse `rpm -qa --xml --files` output.
+///
+/// rpm emits one `<rpmPackage>` per package with a `<version>` element, an
+/// `<arch>`, and a `<format>` block holding `<rpm:entry>` elements for
+/// provides/requires/conflicts/obsoletes plus `<file>` entries.
+pub fn parse_rpmdb_xml(text: &str) -> Result<(Vec<Package>, HashMap<String, Vec<FileRecord>>)> {
+    let doc = crate::xml::parse(text)?;
+    let mut packages = Vec::new();
+    let mut files: HashMap<String, Vec<FileRecord>> = HashMap::new();
+
+    fn collect<'a>(node: &'a crate::xml::Node, name: &str, out: &mut Vec<&'a crate::xml::Node>) {
+        if node.name == name {
+            out.push(node);
+        }
+        for child in &node.children {
+            collect(child, name, out);
+        }
+    }
+
+    fn deps_in(node: &crate::xml::Node, list: &str) -> Vec<Depend> {
+        let mut out = Vec::new();
+        for child in &node.children {
+            if child.name == list || child.name.ends_with(&format!(":{}", list)) {
+                let mut entries = Vec::new();
+                collect(child, "rpm:entry", &mut entries);
+                out.extend(entries.into_iter().map(depend_from_entry));
+            }
+        }
+        out
+    }
+
+    let mut nodes = Vec::new();
+    collect(&doc, "rpmPackage", &mut nodes);
+
+    for node in nodes {
+        let mut pkg = Package {
+            repo: "@System".to_string(),
+            ..Default::default()
+        };
+        for child in &node.children {
+            match child.name.as_str() {
+                "name" => pkg.name = child.text.trim().to_string(),
+                "arch" => pkg.arch = child.text.trim().to_string(),
+                "summary" => pkg.summary = child.text.trim().to_string(),
+                "version" => {
+                    pkg.version = child.attr("ver").unwrap_or("").to_string();
+                    pkg.release = child.attr("rel").unwrap_or("").to_string();
+                    pkg.epoch = child
+                        .attr("epoch")
+                        .and_then(|e| e.parse().ok())
+                        .unwrap_or(0);
+                }
+                "format" => {
+                    pkg.provides = deps_in(child, "provides");
+                    pkg.requires = deps_in(child, "requires");
+                    pkg.conflicts = deps_in(child, "conflicts");
+                    pkg.obsoletes = deps_in(child, "obsoletes");
+
+                    let mut file_nodes = Vec::new();
+                    collect(child, "file", &mut file_nodes);
+                    let manifest: Vec<FileRecord> = file_nodes
+                        .iter()
+                        .filter_map(|file| {
+                            let path = file.text.trim().to_string();
+                            if path.is_empty() {
+                                return None;
+                            }
+                            Some(FileRecord {
+                                path,
+                                size: file.attr("size").and_then(|s| s.parse().ok()).unwrap_or(0),
+                                mode: 0,
+                            })
+                        })
+                        .collect();
+                    if !manifest.is_empty() {
+                        files.insert(pkg.nevra(), manifest);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !pkg.name.is_empty() {
+            packages.push(pkg);
+        }
+    }
+
+    Ok((packages, files))
+}
+
+fn depend_from_entry(entry: &crate::xml::Node) -> Depend {
+    let flags = match entry.attr("flags").unwrap_or("") {
+        "EQ" => DepFlags::EQUAL,
+        "LT" => DepFlags::LESS,
+        "GT" => DepFlags::GREATER,
+        "LE" => DepFlags::LE,
+        "GE" => DepFlags::GE,
+        _ => DepFlags::NONE,
+    };
+    let epoch = entry.attr("epoch").and_then(|e| e.parse().ok()).unwrap_or(0);
+    let evr = match (entry.attr("ver"), entry.attr("rel")) {
+        (Some(ver), Some(rel)) => Some(Evr {
+            epoch,
+            version: ver.to_string(),
+            release: Some(rel.to_string()),
+        }),
+        (Some(ver), None) => Some(Evr {
+            epoch,
+            version: ver.to_string(),
+            release: None,
+        }),
+        _ => None,
+    };
+    Depend {
+        name: entry.attr("name").unwrap_or("").to_string(),
+        flags,
+        evr,
+        rich: None,
+    }
+}
+
+fn rpmdb_packages_flat(installroot: &Path) -> Vec<Package> {
     let output = std::process::Command::new("rpm")
         .arg("--root")
         .arg(installroot)
@@ -380,6 +534,89 @@ mod tests {
         );
         assert_eq!(app.provides.len(), 1);
         assert_eq!(app.provides[0].name, "webclient");
+    }
+
+    /// Modelled on `rpm -qa --xml --files` output.
+    const RPMDB_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rpmHeader>
+<rpmPackage>
+<name>bash</name>
+<version epoch="0" ver="5.2.21" rel="1.fc41"/>
+<arch>x86_64</arch>
+<summary>The GNU Bourne Again shell</summary>
+<format>
+<rpm:license>GPLv3+</rpm:license>
+<rpm:group>System Environment/Shells</rpm:group>
+<rpm:provides><rpm:entry name="bash" flags="EQ" epoch="0" ver="5.2.21" rel="1.fc41"/><rpm:entry name="/bin/sh"/></rpm:provides>
+<rpm:requires><rpm:entry name="glibc" flags="GE" epoch="0" ver="2.38"/><rpm:entry name="rpmlib(CompressedFileNames)" flags="LE" epoch="0" ver="3.0.4" rel="1"/></rpm:requires>
+<rpm:conflicts><rpm:entry name="bash-completion" flags="LT" epoch="0" ver="2.0"/></rpm:conflicts>
+<file type="dir">/etc/bash_completion.d</file>
+<file>/usr/bin/bash</file>
+<file size="1234">/usr/share/doc/bash/README</file>
+</format>
+</rpmPackage>
+<rpmPackage>
+<name>glibc</name>
+<version epoch="0" ver="2.40" rel="3.fc41"/>
+<arch>x86_64</arch>
+<summary>The GNU C Library</summary>
+<format>
+<rpm:provides><rpm:entry name="glibc" flags="EQ" epoch="0" ver="2.40" rel="3.fc41"/></rpm:provides>
+<rpm:requires/>
+</format>
+</rpmPackage>
+</rpmHeader>
+"#;
+
+    #[test]
+    fn parses_rpmdb_xml_with_dependencies_and_files() {
+        let (packages, files) = parse_rpmdb_xml(RPMDB_XML).unwrap();
+        assert_eq!(packages.len(), 2);
+
+        let bash = packages.iter().find(|p| p.name == "bash").unwrap();
+        assert_eq!(bash.version, "5.2.21");
+        assert_eq!(bash.release, "1.fc41");
+        assert_eq!(bash.arch, "x86_64");
+        assert_eq!(bash.repo, "@System");
+        assert_eq!(bash.provides.len(), 2);
+        assert_eq!(bash.provides[1].name, "/bin/sh");
+        assert_eq!(bash.requires.len(), 2);
+        assert_eq!(bash.requires[0].name, "glibc");
+        assert_eq!(bash.requires[0].flags, DepFlags::GE);
+        assert_eq!(
+            bash.requires[0].evr.as_ref().unwrap().version,
+            "2.38"
+        );
+        assert_eq!(bash.conflicts.len(), 1);
+        assert_eq!(bash.conflicts[0].flags, DepFlags::LESS);
+
+        // The shell capability must make a `require /bin/sh` resolvable.
+        let sh = Depend {
+            name: "/bin/sh".to_string(),
+            flags: DepFlags::NONE,
+            evr: None,
+            rich: None,
+        };
+        assert!(bash.satisfies(&sh));
+
+        let manifest = files.get(&bash.nevra()).expect("file manifest");
+        assert_eq!(manifest.len(), 3);
+        assert!(manifest.iter().any(|f| f.path == "/usr/bin/bash"));
+        assert_eq!(
+            manifest
+                .iter()
+                .find(|f| f.path == "/usr/share/doc/bash/README")
+                .unwrap()
+                .size,
+            1234
+        );
+    }
+
+    #[test]
+    fn empty_rpmdb_xml_is_not_an_error() {
+        let (packages, files) = parse_rpmdb_xml("<rpmHeader></rpmHeader>").unwrap();
+        assert!(packages.is_empty());
+        assert!(files.is_empty());
     }
 
     #[test]

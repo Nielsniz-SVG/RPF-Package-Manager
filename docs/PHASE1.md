@@ -115,6 +115,19 @@ dependency that does not name one ("`foo >= 1.0`" matches `1.0-99.fc43`).
 * Policy: an invalid signature is always fatal; `gpgcheck=1` refuses packages
   that are unsigned or signed by an unknown key; `gpgcheck=0` warns instead.
 
+### rpmdb interoperability
+* Reading: `rpm -qa --xml --files` gives name, EVR, architecture, provides,
+  requires, conflicts, obsoletes and file lists in a documented format. RPF
+  parses it with its own XML reader, so a system installed by dnf is understood
+  well enough to resolve against (`rpf install` sees that glibc is already
+  there) and to remove from (`rpf remove` deletes the files rpm recorded).
+  Older rpm builds without `--xml` fall back to the `--queryformat` form.
+* Writing: deliberately out of scope. rpm's on-disk database is rpm's to
+  write; a bug there corrupts the package manager's own view of the system.
+  Packages RPF installs are recorded in `installed.rpf`, which `rpm -qa` will
+  not show. This is a real limitation and is stated as such instead of being
+  papered over.
+
 ### Storage
 A custom binary cache (`packages.rpf` + `meta` per repository) written
 atomically. No SQLite dependency: the format is length-prefixed and loads in a
@@ -128,7 +141,7 @@ so a hostile id cannot escape the cache directory.
 | **Scriptlet macro expansion** | `%pre`/`%post`/`%preun`/`%postun` are executed through `/bin/sh` (through `chroot` for an `--installroot`) and receive rpm's `$1` argument. Bodies that contain `%{...}` macros are not expanded yet, and scriptlets are skipped with a warning when RPF is not root. |
 | **EdDSA / ECDSA signatures** | RSA is what Fedora signs with, so RSA was implemented first. Ed25519 and ECDSA keys are detected, reported as unsupported and refused — never silently accepted. |
 | **Key trust model** | Expiry, revocation and web-of-trust are not evaluated. A key in the keyring is trusted, which matches `rpm --import`. |
-| **rpmdb interoperability** | Writing rpm's SQLite database is out of scope for now. RPF keeps `installed.rpf` (now including dependency records) and reads `rpm -qa` as a fallback so it can reason about an existing system. |
+| **Writing the rpmdb** | Reading is implemented; writing rpm's own database is not, by choice. Installing with RPF therefore does not make a package visible to `rpm -qa` or to dnf. |
 | **`filelists.xml` / `other.xml`** | Only `primary.xml` is parsed. Full file queries (`rpf provides /usr/bin/foo` for non-primary files) need filelists, which is a phase 1.x item. |
 | **Modules, comps groups, delta RPMs, `--downloadonly` semantics** | Not part of the foundation. |
 | **Parallel downloads** | Downloads are sequential per package. `max_parallel_downloads` is parsed but not yet acted on. |
@@ -161,18 +174,19 @@ accident.
 * The real `basic-gzip.rpm` fixture is also installed into a scratch
   `--installroot` and compared file by file.
 
-`cargo test` runs 157 tests: 115 library unit tests, 4 CLI unit tests, 23
-installation tests and 15 end-to-end tests.
+`cargo test` runs 161 tests: 117 library unit tests, 4 CLI unit tests, 25
+installation tests and 15 end-to-end tests. The rpmdb tests run against a
+stand-in `rpm` executable that emits genuine `--xml` output, so the parsing and
+the fallback paths are exercised without rpm being installed.
 
 ## Next steps
 
-1. **rpmdb** — write rpm's own database so RPF and rpm agree on what is
-   installed, or document the incompatibility as a deliberate choice.
-2. **Scriptlet macro expansion** — `%{_bindir}` and friends.
-3. **EdDSA/ECDSA verification** — needed only if a repository we must support
+1. **Scriptlet macro expansion** — `%{_bindir}` and friends.
+2. **EdDSA/ECDSA verification** — needed only if a repository we must support
    signs with those algorithms.
-4. **Polish** — parallel downloads, progress output, `filelists` for file
-   queries, shell completion.
+3. **`filelists.xml`** — so file queries work for files that are not in
+   `primary.xml`.
+4. **Polish** — parallel downloads, progress output, shell completion.
 
 Phase 2 (feature parity and beyond) starts only once 1–3 are done and the
 foundation installs, upgrades and removes packages cleanly on a real Fedora

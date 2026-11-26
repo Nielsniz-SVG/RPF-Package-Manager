@@ -326,7 +326,24 @@ pub fn remove(config: &Config, names: &[String], opts: &Options) -> Result<Repor
     let mut report = Report::default();
     let mut db = InstalledDb::load(&config.conf.dbpath)?;
 
+    // Packages that came from the system's rpmdb are not in `installed.rpf`;
+    // fall back to rpm's own record so `rpf remove` still knows what it owns.
+    // Only the packages being removed are imported, so nothing else leaks into
+    // RPF's database.
+    let mut rpmdb = None;
+
     for name in names {
+        if db.get(name).is_none() {
+            if rpmdb.is_none() {
+                rpmdb = crate::db::rpmdb_entries(&config.conf.installroot);
+            }
+            if let Some((packages, files)) = &rpmdb {
+                if let Some(pkg) = packages.iter().find(|p| &p.name == name) {
+                    let manifest = files.get(&pkg.nevra()).cloned().unwrap_or_default();
+                    db.add(pkg.clone(), manifest, 0);
+                }
+            }
+        }
         let Some(pkg) = db.get(name).cloned() else {
             return Err(Error::new(format!("package '{}' is not installed", name)));
         };
