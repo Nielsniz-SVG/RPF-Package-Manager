@@ -75,8 +75,14 @@ impl Fixture {
         self.root.join(rel)
     }
 
-    /// Write the repository: fake RPMs, primary.xml(.gz) and repomd.xml.
+    /// Write the repository: fake RPMs, primary.xml(.gz), filelists.xml(.gz)
+    /// and repomd.xml.
     fn build(&self) {
+        let mut filelists = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists">
+"#,
+        );
         let mut primary = String::from(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm">
@@ -88,6 +94,22 @@ impl Fixture {
             let body = format!("FAKE RPM PAYLOAD for {}\n", filename);
             fs::write(self.path(&format!("repo/Packages/{}", filename)), &body).unwrap();
             let checksum = digest::hex(&digest::sha256(body.as_bytes()));
+
+            // The package also ships a documentation file that primary.xml
+            // does not mention: only filelists.xml knows about it.
+            filelists.push_str(&format!(
+                r#"<package pkgid="{checksum}" name="{name}" arch="{arch}">
+  <version epoch="0" ver="{version}" rel="{release}"/>
+  <file>/usr/bin/{name}</file>
+  <file>/usr/share/{name}/data.txt</file>
+</package>
+"#,
+                checksum = checksum,
+                name = pkg.name,
+                arch = pkg.arch,
+                version = pkg.version,
+                release = pkg.release,
+            ));
 
             primary.push_str(&format!(
                 r#"<package type="rpm">
@@ -144,6 +166,7 @@ impl Fixture {
             ));
         }
         primary.push_str("</metadata>\n");
+        filelists.push_str("</filelists>\n");
 
         // Compress primary.xml with the system gzip, as a real repo would.
         let plain = self.path("repo/repodata/primary.xml");
@@ -172,6 +195,28 @@ impl Fixture {
             }
         };
 
+        // filelists.xml, compressed the same way.
+        let fl_plain = self.path("repo/repodata/filelists.xml");
+        fs::write(&fl_plain, &filelists).unwrap();
+        let fl_gz = self.path("repo/repodata/filelists.xml.gz");
+        let fl_ok = Command::new("sh")
+            .arg("-c")
+            .arg(format!("gzip -c {} > {}", fl_plain.display(), fl_gz.display()))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let (fl_location, fl_compressed) = if fl_ok {
+            (
+                "repodata/filelists.xml.gz",
+                digest::hex(&digest::sha256(&fs::read(&fl_gz).unwrap())),
+            )
+        } else {
+            (
+                "repodata/filelists.xml",
+                digest::hex(&digest::sha256(filelists.as_bytes())),
+            )
+        };
+
         let repomd = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <repomd xmlns="http://linux.duke.edu/metadata/repo">
@@ -183,12 +228,23 @@ impl Fixture {
     <timestamp>1750000000</timestamp>
     <size>{size}</size>
   </data>
+  <data type="filelists">
+    <checksum type="sha256">{fl_compressed}</checksum>
+    <open-checksum type="sha256">{fl_open}</open-checksum>
+    <location href="{fl_location}"/>
+    <timestamp>1750000000</timestamp>
+    <size>{fl_size}</size>
+  </data>
 </repomd>
 "#,
             compressed = compressed,
             open_checksum = open_checksum,
             location = location,
             size = fs::metadata(&plain).map(|m| m.len()).unwrap_or(0),
+            fl_compressed = fl_compressed,
+            fl_open = digest::hex(&digest::sha256(filelists.as_bytes())),
+            fl_location = fl_location,
+            fl_size = fs::metadata(&fl_plain).map(|m| m.len()).unwrap_or(0),
         );
         fs::write(self.path("repo/repodata/repomd.xml"), repomd).unwrap();
 
@@ -290,6 +346,37 @@ fn list_search_info_and_provides() {
 
     let out = f.stdout(&["provides", "/bin/sh"]);
     assert!(out.contains("bash"), "{}", out);
+
+    // A primary file is answered from primary.xml.
+    let out = f.stdout(&["provides", "/usr/bin/glibc"]);
+    assert!(out.contains("glibc"), "{}", out);
+}
+
+/// Files that only `filelists.xml` lists must still resolve to their package.
+#[test]
+fn provides_finds_files_from_filelists() {
+    let f = Fixture::new("filelists");
+    // Prime the metadata cache, as a first `makecache` would.
+    f.stdout(&["makecache"]);
+
+    let out = f.stdout(&["provides", "/usr/share/bash/data.txt"]);
+    assert!(out.contains("bash-5.2.21"), "{}", out);
+    assert!(
+        f.path("cache/testrepo/filelists.rpf").exists(),
+        "file lists should be cached"
+    );
+
+    // Unknown paths are still reported as unknown.
+    let out = f.stdout(&["provides", "/usr/share/does-not-exist"]);
+    assert!(
+        out.contains("No package provides"),
+        "unknown path should not match: {}",
+        out
+    );
+
+    // And the cached file lists answer without touching the repository again.
+    let out = f.stdout(&["--cacheonly", "provides", "/usr/share/glibc/data.txt"]);
+    assert!(out.contains("glibc"), "{}", out);
 }
 
 #[test]

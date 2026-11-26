@@ -110,6 +110,33 @@ impl RepoMd {
     }
 }
 
+/// One `<package>` entry from `filelists.xml`: every file the package owns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileList {
+    pub name: String,
+    pub arch: String,
+    pub epoch: u32,
+    pub version: String,
+    pub release: String,
+    /// Paths exactly as rpm stores them, directories included.
+    pub files: Vec<String>,
+}
+
+impl FileList {
+    /// The same `name-[epoch:]version-release.arch` form `Package::nevra` uses,
+    /// so file lists can be attached to the packages they belong to.
+    pub fn nevra(&self) -> String {
+        if self.epoch != 0 {
+            format!(
+                "{}-{}:{}-{}.{}",
+                self.name, self.epoch, self.version, self.release, self.arch
+            )
+        } else {
+            format!("{}-{}-{}.{}", self.name, self.version, self.release, self.arch)
+        }
+    }
+}
+
 /// Mirrors advertised by a metalink document.
 #[derive(Debug, Clone, Default)]
 pub struct Metalink {
@@ -435,6 +462,66 @@ pub fn parse_primary(text: &str, repo_id: &str) -> Result<Vec<Package>> {
     Ok(packages)
 }
 
+/// Parse `filelists.xml`: the complete file manifest of every package.
+///
+/// The document is far larger than `primary.xml`, so callers cache the parsed
+/// result instead of keeping it in memory for every command.
+pub fn parse_filelists(text: &str) -> Result<Vec<FileList>> {
+    let mut reader = Reader::new(text);
+    let mut out: Vec<FileList> = Vec::new();
+    let mut cur: Option<FileList> = None;
+
+    while let Some(ev) = reader.next()? {
+        match ev {
+            Event::Start {
+                name,
+                attrs,
+                self_closing,
+            } => match local(name) {
+                "package" => {
+                    let mut entry = FileList {
+                        name: xml::unescape(attr_str(&attrs, "name").unwrap_or("")),
+                        arch: xml::unescape(attr_str(&attrs, "arch").unwrap_or("")),
+                        ..FileList::default()
+                    };
+                    entry.epoch = attr_u32(&attrs, "epoch");
+                    cur = Some(entry);
+                }
+                "version" => {
+                    if let Some(entry) = cur.as_mut() {
+                        entry.epoch = attr_u32(&attrs, "epoch");
+                        entry.version = xml::unescape(attr_str(&attrs, "ver").unwrap_or(""));
+                        entry.release = xml::unescape(attr_str(&attrs, "rel").unwrap_or(""));
+                    }
+                }
+                "file" => {
+                    if !self_closing {
+                        let path = reader.text()?;
+                        if let Some(entry) = cur.as_mut() {
+                            if !path.is_empty() {
+                                entry.files.push(path);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Event::End { name } => {
+                if local(name) == "package" {
+                    if let Some(entry) = cur.take() {
+                        if !entry.name.is_empty() {
+                            out.push(entry);
+                        }
+                    }
+                }
+            }
+            Event::Text(_) => {}
+        }
+    }
+
+    Ok(out)
+}
+
 fn depend_from_attrs(attrs: &[(&str, &str)]) -> Depend {
     let name = xml::unescape(attr_str(attrs, "name").unwrap_or(""));
     let flags = DepFlags::parse(attr_str(attrs, "flags").unwrap_or(""));
@@ -570,6 +657,58 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn parses_filelists() {
+        let text = r#"<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="2">
+<package pkgid="abc123" name="bash" arch="x86_64">
+  <version epoch="0" ver="5.2.21" rel="1.fc41"/>
+  <file type="dir">/usr/share/doc/bash</file>
+  <file>/usr/bin/bash</file>
+  <file>/usr/share/man/man1/bash.1.gz</file>
+</package>
+<package pkgid="def456" name="kernel" arch="noarch">
+  <version epoch="1" ver="6.12" rel="3.fc41"/>
+  <file>/boot/vmlinuz</file>
+</package>
+</filelists>"#;
+        let lists = parse_filelists(text).expect("filelists parse");
+        assert_eq!(lists.len(), 2);
+
+        assert_eq!(lists[0].name, "bash");
+        assert_eq!(lists[0].arch, "x86_64");
+        assert_eq!(lists[0].nevra(), "bash-5.2.21-1.fc41.x86_64");
+        assert_eq!(
+            lists[0].files,
+            vec![
+                "/usr/share/doc/bash",
+                "/usr/bin/bash",
+                "/usr/share/man/man1/bash.1.gz"
+            ]
+        );
+
+        assert_eq!(lists[1].nevra(), "kernel-1:6.12-3.fc41.noarch");
+        assert_eq!(lists[1].files, vec!["/boot/vmlinuz"]);
+    }
+
+    /// A repo that publishes no file lists must simply report none.
+    #[test]
+    fn filelists_absence_is_not_an_error() {
+        let repomd = RepoMd::parse(REPOMD).expect("repomd");
+        assert!(repomd.primary().is_some());
+        let filelists = repomd.filelists().expect("fixture advertises filelists");
+        assert_eq!(filelists.location, "repodata/filelists.xml.gz");
+        assert_eq!(filelists.checksum_type, "sha256");
+
+        let without = RepoMd::parse(
+            r#"<repomd><revision>1</revision>
+               <data type=\"primary\"><location href=\"repodata/primary.xml\"/></data></repomd>"#,
+        )
+        .expect("repomd");
+        assert!(without.filelists().is_none());
+        assert!(parse_filelists("<filelists/>").unwrap().is_empty());
+    }
+
     fn parses_primary_packages() {
         let pkgs = parse_primary(PRIMARY, "fedora").unwrap();
         assert_eq!(pkgs.len(), 2);

@@ -139,7 +139,10 @@ dependency that does not name one ("`foo >= 1.0`" matches `1.0-99.fc43`).
 
 ### Storage
 A custom binary cache (`packages.rpf` + `meta` per repository) written
-atomically. No SQLite dependency: the format is length-prefixed and loads in a
+atomically. File lists are kept in a separate `filelists.rpf`, because
+`filelists.xml` is an order of magnitude larger than `primary.xml` and only
+needed when a query asks about a file path; it is fetched and cached on demand
+and stamped with the repository revision it belongs to. No SQLite dependency: the format is length-prefixed and loads in a
 single pass. Repository ids are sanitised before being used as path components
 so a hostile id cannot escape the cache directory.
 
@@ -151,7 +154,7 @@ so a hostile id cannot escape the cache directory.
 | **Other signature curves (P-384, P-521, Brainpool) and DSA** | RSA, Ed25519 and NIST P-256 cover Fedora, RPM Fusion and the packages rpm itself can sign with in practice. Any other algorithm is detected, reported as unsupported and refused — never silently accepted. |
 | **Key trust model** | Expiry, revocation and web-of-trust are not evaluated. A key in the keyring is trusted, which matches `rpm --import`. |
 | **Writing the rpmdb** | Reading is implemented; writing rpm's own database is not, by choice. Installing with RPF therefore does not make a package visible to `rpm -qa` or to dnf. |
-| **`filelists.xml` / `other.xml`** | Only `primary.xml` is parsed. Full file queries (`rpf provides /usr/bin/foo` for non-primary files) need filelists, which is a phase 1.x item. |
+| **`other.xml` (changelogs)** | `primary.xml` and `filelists.xml` are parsed; `other.xml` only carries changelogs, which nothing in RPF displays yet. |
 | **Modules, comps groups, delta RPMs, `--downloadonly` semantics** | Not part of the foundation. |
 | **Parallel downloads** | Downloads are sequential per package. `max_parallel_downloads` is parsed but not yet acted on. |
 
@@ -183,17 +186,15 @@ accident.
 * The real `basic-gzip.rpm` fixture is also installed into a scratch
   `--installroot` and compared file by file.
 
-`cargo test` runs 170 tests: 122 library unit tests, 4 CLI unit tests, 25
-installation tests, 15 end-to-end tests and 4 curve-signature tests. The rpmdb
+`cargo test` runs 173 tests: 124 library unit tests, 4 CLI unit tests, 25
+installation tests, 16 end-to-end tests and 4 curve-signature tests. The rpmdb
 tests run against a stand-in `rpm` executable that emits genuine `--xml` output,
 so the parsing and the fallback paths are exercised without rpm being installed.
 
 ## Next steps
 
-1. **`filelists.xml`** — so file queries work for files that are not in
-   `primary.xml`.
-2. **Polish** — parallel downloads, progress output, shell completion.
+1. **Polish** — parallel downloads, progress output, shell completion.
 
-Phase 2 (feature parity and beyond) starts only once 1–2 are done and the
+Phase 2 (feature parity and beyond) starts once 1 is done and the
 foundation installs, upgrades and removes packages cleanly on a real Fedora
 system.

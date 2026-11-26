@@ -60,7 +60,7 @@ verification and scriptlets — see the table below and
 | `.repo` file parsing, `$releasever`/`$basearch`, `--setopt`, enable/disable | **Working** |
 | Built-in Fedora + RPM Fusion free/nonfree repository set | **Working** |
 | metalink and mirrorlist discovery, mirror failover | **Working** |
-| `repomd.xml` / `primary.xml` parsing incl. rich deps | **Working** |
+| `repomd.xml`, `primary.xml` (incl. rich deps) and `filelists.xml` | **Working** |
 | SHA-256 verification of metadata and packages | **Working** |
 | rpm version comparison (`~`, `^`, epochs, releases) | **Working** |
 | Dependency solver: transitive deps, obsoletes, conflicts, ordering | **Working** |
@@ -101,7 +101,7 @@ the same model `rpm --import` uses.
 
 ```sh
 cargo build --release      # -> target/release/rpf
-cargo test                 # 170 tests: unit, end-to-end, installation
+cargo test                 # 173 tests: unit, end-to-end, installation
 ```
 
 Requirements: a Rust toolchain (1.70+). At runtime on Fedora, RPF uses `curl`
@@ -153,7 +153,7 @@ override them; files on disk take precedence over the built-ins.
 | `src/ini.rs` | Permissive INI reader for `.repo` files |
 | `src/config.rs` | Variables, repository discovery, overrides, COPR definitions |
 | `src/fetch.rs` | `curl`/`file://` transport, decompression |
-| `src/repomd.rs` | `repomd.xml`, metalink, mirrorlist, `primary.xml` |
+| `src/repomd.rs` | `repomd.xml`, metalink, mirrorlist, `primary.xml`, `filelists.xml` |
 | `src/version.rs` | `rpmvercmp`, EVR comparison |
 | `src/deps.rs` | Dependency flags, capability matching, rich dependencies |
 | `src/pkg.rs` | Package model, implicit provides, arch rules |

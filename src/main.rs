@@ -519,11 +519,20 @@ fn cmd_provides(args: &Args) -> Result<i32> {
     let caches = load_metadata(&config, args)?;
     let available = available_packages(&caches);
 
+    // `primary.xml` only lists a package's primary files, so a path query
+    // needs the repository's file lists. Fetch them only when asked for a path.
+    let filelists = if args.rest.iter().any(|needle| needle.contains('/')) {
+        cache::all_filelists(&config, &caches, args.cacheonly)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut hits = 0;
     for needle in &args.rest {
         for pkg in &available {
             let owner = pkg.provides.iter().any(|p| p.name == *needle)
-                || needle.contains('/') && pkg.owns_file(needle);
+                || needle.contains('/')
+                    && (pkg.owns_file(needle) || owns_from_filelists(&filelists, pkg, needle));
             if owner || spec_matches(pkg, needle) {
                 println!("{:<28} {} : {}", needle, pkg.nevra(), pkg.summary);
                 hits += 1;
@@ -534,6 +543,18 @@ fn cmd_provides(args: &Args) -> Result<i32> {
         println!("No package provides the requested capability.");
     }
     Ok(0)
+}
+
+/// Does this package own `path` according to the repository's file lists?
+fn owns_from_filelists(
+    filelists: &std::collections::HashMap<String, Vec<String>>,
+    pkg: &Package,
+    path: &str,
+) -> bool {
+    match filelists.get(&cache::filelist_key(pkg)) {
+        Some(files) => files.iter().any(|f| f == path),
+        None => false,
+    }
 }
 
 fn cmd_repoquery(args: &Args) -> Result<i32> {

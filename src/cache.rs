@@ -16,11 +16,15 @@ use crate::pkg::Package;
 use crate::repomd::{self, Metalink, RepoMd};
 use crate::version::Evr;
 use crate::{digest, Error, Result};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"RPFDB\x00\x01\x00";
+/// Separate file for `filelists.xml`, which is far larger than `primary.xml`
+/// and only needed when a query asks about file paths.
+const FILELISTS_MAGIC: &[u8; 8] = b"RPFFL\x00\x01\x00";
 
 #[derive(Debug, Clone, Default)]
 pub struct CachedRepo {
@@ -76,6 +80,16 @@ fn packages_path(cachedir: &Path, repo_id: &str) -> PathBuf {
 
 fn meta_path(cachedir: &Path, repo_id: &str) -> PathBuf {
     repo_dir(cachedir, repo_id).join("meta")
+}
+
+fn filelists_path(cachedir: &Path, repo_id: &str) -> PathBuf {
+    repo_dir(cachedir, repo_id).join("filelists.rpf")
+}
+
+/// Cache key for a package's file list: repositories can carry the same NEVRA,
+/// so the repo id is part of the key.
+pub fn filelist_key(pkg: &Package) -> String {
+    format!("{}\u{1f}{}", pkg.repo, pkg.nevra())
 }
 
 /// Read a repository's cached packages, if any.
@@ -262,6 +276,148 @@ fn verify_bytes(data: &[u8], algo: &str, expected: &str) -> Result<()> {
     }
 }
 
+/// The complete file list of one repository, keyed by [`filelist_key`].
+///
+/// `primary.xml` only carries the *primary* files of a package (binaries,
+/// libraries, `%config`), so ownership queries for anything else need
+/// `filelists.xml`. That document is roughly twenty times the size of
+/// `primary.xml`, so it is fetched on demand and cached in its own file rather
+/// than merged into `packages.rpf`.
+pub fn filelists(
+    config: &Config,
+    repo: &Repo,
+    cached: &CachedRepo,
+    cacheonly: bool,
+) -> Result<HashMap<String, Vec<String>>> {
+    if let Some(map) = read_filelists(&config.conf.cachedir, &repo.id, &cached.revision) {
+        return Ok(map);
+    }
+    if cacheonly {
+        return Err(Error::new(format!(
+            "file lists for repository '{}' are not cached and --cacheonly was given",
+            repo.id
+        )));
+    }
+
+    let bases = resolve_bases(repo)?;
+    let repomd = fetch_repomd(config, repo, &bases)?;
+    let data = match repomd.filelists() {
+        Some(data) => data,
+        // A repository without file lists simply cannot answer file queries.
+        None => return Ok(HashMap::new()),
+    };
+
+    let (_, compressed) = fetch::fetch_bytes_from_mirrors(&bases, &data.location)
+        .map_err(|e| e.context(format!("repository '{}' file lists", repo.id)))?;
+    if !data.checksum.is_empty() {
+        verify_bytes(&compressed, &data.checksum_type, &data.checksum)
+            .map_err(|e| e.context(format!("repository '{}' file lists", repo.id)))?;
+    }
+    let xml_text = fetch::decompress_to_string(compressed, &data.location)?;
+    if let Some((algo, expected)) = &data.open_checksum {
+        verify_bytes(xml_text.as_bytes(), algo, expected)
+            .map_err(|e| e.context(format!("repository '{}' (file lists open checksum)", repo.id)))?;
+    }
+
+    let entries = repomd::parse_filelists(&xml_text)?;
+    let map = attach_filelists(cached, entries);
+    write_filelists(&config.conf.cachedir, repo, &cached.revision, &map)?;
+    Ok(map)
+}
+
+/// Keep the file lists we have packages for; `filelists.xml` also describes
+/// packages that `primary.xml` filtered out.
+fn attach_filelists(
+    cached: &CachedRepo,
+    entries: Vec<repomd::FileList>,
+) -> HashMap<String, Vec<String>> {
+    let mut by_nevra: HashMap<String, usize> = HashMap::with_capacity(cached.packages.len());
+    for (index, pkg) in cached.packages.iter().enumerate() {
+        by_nevra.insert(pkg.nevra(), index);
+    }
+
+    let mut out = HashMap::with_capacity(cached.packages.len());
+    for entry in entries {
+        if let Some(index) = by_nevra.get(&entry.nevra()) {
+            let pkg = &cached.packages[*index];
+            out.insert(filelist_key(pkg), entry.files);
+        }
+    }
+    out
+}
+
+/// File lists for every loaded repository, fetched on demand.
+pub fn all_filelists(
+    config: &Config,
+    caches: &[CachedRepo],
+    cacheonly: bool,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut out = HashMap::new();
+    for cached in caches {
+        let repo = match config.repos.iter().find(|r| r.id == cached.repo_id) {
+            Some(repo) => repo,
+            None => continue,
+        };
+        out.extend(filelists(config, repo, cached, cacheonly)?);
+    }
+    Ok(out)
+}
+
+fn read_filelists(
+    cachedir: &Path,
+    repo_id: &str,
+    revision: &str,
+) -> Option<HashMap<String, Vec<String>>> {
+    let path = filelists_path(cachedir, repo_id);
+    let bytes = fs::read(&path).ok()?;
+    let mut cur = Cursor::new(&bytes);
+    if cur.take(FILELISTS_MAGIC.len()).ok()? != FILELISTS_MAGIC {
+        return None;
+    }
+    let stored_revision = cur.string().ok()?;
+    if stored_revision != revision {
+        // Metadata moved on; the file lists have to be fetched again.
+        return None;
+    }
+    let count = cur.u32().ok()? as usize;
+    let mut out = HashMap::with_capacity(count.min(1_000_000));
+    for _ in 0..count {
+        let key = cur.string().ok()?;
+        let files = cur.string_list().ok()?;
+        out.insert(key, files);
+    }
+    Some(out)
+}
+
+fn write_filelists(
+    cachedir: &Path,
+    repo: &Repo,
+    revision: &str,
+    map: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    let dir = repo_dir(cachedir, &repo.id);
+    fs::create_dir_all(&dir).map_err(|e| Error::new(format!("{}: {}", dir.display(), e)))?;
+
+    let mut out = Vec::with_capacity(4096);
+    out.extend_from_slice(FILELISTS_MAGIC);
+    let mut w = Encoder::new(&mut out);
+    w.str(revision);
+    w.u32(map.len() as u32);
+    let mut keys: Vec<&String> = map.keys().collect();
+    // Deterministic output makes the cache diffable and tests stable.
+    keys.sort();
+    for key in keys {
+        w.str(key);
+        w.string_list(&map[key]);
+    }
+
+    let path = filelists_path(cachedir, &repo.id);
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &out).map_err(|e| Error::new(format!("{}: {}", tmp.display(), e)))?;
+    fs::rename(&tmp, &path).map_err(|e| Error::new(format!("{}: {}", path.display(), e)))?;
+    Ok(())
+}
+
 /// Load metadata for every enabled repository, syncing when necessary.
 pub fn load_all(config: &Config, cacheonly: bool, force: bool) -> Result<Vec<CachedRepo>> {
     let mut out = Vec::new();
@@ -374,6 +530,13 @@ impl<'a> Encoder<'a> {
         }
     }
 
+    fn string_list(&mut self, values: &[String]) {
+        self.u32(values.len() as u32);
+        for value in values {
+            self.str(value);
+        }
+    }
+
     fn dep_list(&mut self, deps: &[Depend]) {
         self.u32(deps.len() as u32);
         for d in deps {
@@ -461,6 +624,15 @@ impl<'a> Cursor<'a> {
         let len = self.u32()? as usize;
         let bytes = self.take(len)?;
         String::from_utf8(bytes.to_vec()).map_err(|e| Error::new(e.to_string()))
+    }
+
+    fn string_list(&mut self) -> Result<Vec<String>> {
+        let count = self.u32()? as usize;
+        let mut out = Vec::with_capacity(count.min(1_000_000));
+        for _ in 0..count {
+            out.push(self.string()?);
+        }
+        Ok(out)
     }
 
     fn opt_string(&mut self) -> Result<Option<String>> {

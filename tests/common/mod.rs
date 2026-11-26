@@ -270,6 +270,9 @@ pub struct PkgSpec {
     pub post_script: Option<String>,
     /// Interpreter for that scriptlet, e.g. "/sbin/ldconfig".
     pub post_script_prog: Option<String>,
+    /// Paths that are in the package but *not* listed as primary files in
+    /// `primary.xml`, so only `filelists.xml` knows about them.
+    pub non_primary: Vec<String>,
 }
 
 impl PkgSpec {
@@ -288,7 +291,16 @@ impl PkgSpec {
             compress: false,
             post_script: None,
             post_script_prog: None,
+            non_primary: Vec::new(),
         }
+    }
+
+    /// Ship a file that only `filelists.xml` mentions, the way real
+    /// repositories do for most of a package's contents.
+    pub fn with_non_primary_file(mut self, file: FileSpec) -> Self {
+        self.non_primary.push(file.path.clone());
+        self.files.push(file);
+        self
     }
 
     pub fn with_file(mut self, file: FileSpec) -> Self {
@@ -542,6 +554,10 @@ impl RepoFixture {
     /// Write the given packages and generate metadata for the repository.
     pub fn publish(&self, packages: &[PkgSpec]) -> Vec<PathBuf> {
         let mut written = Vec::new();
+        let mut filelists = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <filelists xmlns=\"http://linux.duke.edu/metadata/filelists\">\n",
+        );
         let mut primary = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <metadata xmlns=\"http://linux.duke.edu/metadata/common\" \
@@ -569,6 +585,34 @@ impl RepoFixture {
                 .map(|r| format!("<rpm:entry name=\"{}\"/>", r))
                 .collect::<String>();
 
+            // primary.xml lists only the primary files, exactly like a real
+            // repository; filelists.xml lists everything.
+            let primary_files: String = spec
+                .files
+                .iter()
+                .filter(|f| !spec.non_primary.contains(&f.path))
+                .map(|f| format!("    <file>{}</file>\n", f.path))
+                .collect();
+            let all_files: String = spec
+                .files
+                .iter()
+                .map(|f| format!("    <file>{}</file>\n", f.path))
+                .collect();
+
+            filelists.push_str(&format!(
+                r#"<package pkgid="{checksum}" name="{name}" arch="{arch}">
+  <version epoch="{epoch}" ver="{version}" rel="{release}"/>
+{files}</package>
+"#,
+                checksum = checksum,
+                name = spec.name,
+                arch = spec.arch,
+                epoch = spec.epoch,
+                version = spec.version,
+                release = spec.release,
+                files = all_files,
+            ));
+
             primary.push_str(&format!(
                 r#"<package type="rpm">
   <name>{name}</name><arch>{arch}</arch>
@@ -586,7 +630,7 @@ impl RepoFixture {
     <rpm:provides>{provides}</rpm:provides>
     <rpm:requires>{requires}</rpm:requires>
   </format>
-</package>
+{files}</package>
 "#,
                 name = spec.name,
                 arch = spec.arch,
@@ -601,15 +645,25 @@ impl RepoFixture {
                 license = spec.license,
                 provides = provides,
                 requires = requires,
+                files = primary_files,
             ));
         }
         primary.push_str("</metadata>\n");
+        filelists.push_str("</filelists>\n");
 
         let plain = self.path("repo/repodata/primary.xml");
         fs::write(&plain, &primary).unwrap();
         let compressed = gzip(primary.as_bytes());
         let gz = self.path("repo/repodata/primary.xml.gz");
         fs::write(&gz, &compressed).unwrap();
+
+        let fl_compressed = gzip(filelists.as_bytes());
+        fs::write(self.path("repo/repodata/filelists.xml"), &filelists).unwrap();
+        fs::write(
+            self.path("repo/repodata/filelists.xml.gz"),
+            &fl_compressed,
+        )
+        .unwrap();
 
         let repomd = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -619,10 +673,18 @@ impl RepoFixture {
              <open-checksum type=\"sha256\">{}</open-checksum>\
              <location href=\"repodata/primary.xml.gz\"/>\
              <timestamp>1700000000</timestamp><size>{}</size>\
+             </data><data type=\"filelists\">\
+             <checksum type=\"sha256\">{}</checksum>\
+             <open-checksum type=\"sha256\">{}</open-checksum>\
+             <location href=\"repodata/filelists.xml.gz\"/>\
+             <timestamp>1700000000</timestamp><size>{}</size>\
              </data></repomd>\n",
             digest::hex(&digest::sha256(&compressed)),
             digest::hex(&digest::sha256(primary.as_bytes())),
-            compressed.len()
+            compressed.len(),
+            digest::hex(&digest::sha256(&fl_compressed)),
+            digest::hex(&digest::sha256(filelists.as_bytes())),
+            fl_compressed.len()
         );
         fs::write(self.path("repo/repodata/repomd.xml"), repomd).unwrap();
 
@@ -724,6 +786,29 @@ impl RepoFixture {
         fs::write(&plain, &primary).unwrap();
         let compressed = gzip(primary.as_bytes());
         fs::write(self.path("repo/repodata/primary.xml.gz"), &compressed).unwrap();
+
+        // The package's own header lists every file it ships.
+        let all_files: String = pkg
+            .files
+            .iter()
+            .map(|f| format!("    <file>{}</file>\n", f))
+            .collect();
+        let filelists = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <filelists xmlns=\"http://linux.duke.edu/metadata/filelists\">\n\
+             <package pkgid=\"{}\" name=\"{}\" arch=\"{}\">\n\
+             <version epoch=\"{}\" ver=\"{}\" rel=\"{}\"/>\n\
+             {}</package>\n</filelists>\n",
+            checksum, pkg.name, pkg.arch, pkg.epoch, pkg.version, pkg.release, all_files
+        );
+        let fl_compressed = gzip(filelists.as_bytes());
+        fs::write(self.path("repo/repodata/filelists.xml"), &filelists).unwrap();
+        fs::write(
+            self.path("repo/repodata/filelists.xml.gz"),
+            &fl_compressed,
+        )
+        .unwrap();
+
         let repomd = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <repomd xmlns=\"http://linux.duke.edu/metadata/repo\">\
@@ -732,10 +817,18 @@ impl RepoFixture {
              <open-checksum type=\"sha256\">{}</open-checksum>\
              <location href=\"repodata/primary.xml.gz\"/>\
              <timestamp>1700000000</timestamp><size>{}</size>\
+             </data><data type=\"filelists\">\
+             <checksum type=\"sha256\">{}</checksum>\
+             <open-checksum type=\"sha256\">{}</open-checksum>\
+             <location href=\"repodata/filelists.xml.gz\"/>\
+             <timestamp>1700000000</timestamp><size>{}</size>\
              </data></repomd>\n",
             digest::hex(&digest::sha256(&compressed)),
             digest::hex(&digest::sha256(primary.as_bytes())),
-            compressed.len()
+            compressed.len(),
+            digest::hex(&digest::sha256(&fl_compressed)),
+            digest::hex(&digest::sha256(filelists.as_bytes())),
+            fl_compressed.len()
         );
         fs::write(self.path("repo/repodata/repomd.xml"), repomd).unwrap();
         dest
