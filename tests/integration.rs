@@ -379,6 +379,55 @@ fn provides_finds_files_from_filelists() {
     assert!(out.contains("glibc"), "{}", out);
 }
 
+/// Downloads may run concurrently; the result must be the same as a serial run.
+#[test]
+fn parallel_downloads_fetch_every_package() {
+    let f = Fixture::new("parallel");
+    let out = f.stdout(&["--setopt=max_parallel_downloads=4", "download", "bash"]);
+    for name in ["bash-5.2.21", "glibc-2.40", "ncurses-libs-6.5"] {
+        assert!(out.contains(name), "{} missing from output: {}", name, out);
+    }
+
+    let packages = f.path("cache/packages");
+    let count = fs::read_dir(&packages).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(count, 3, "every dependency should be downloaded");
+
+    // A second run must reuse the cache instead of failing on the lock-free path.
+    let out = f.stdout(&["--setopt=max_parallel_downloads=2", "download", "bash"]);
+    assert!(out.contains("bash-5.2.21"), "{}", out);
+}
+
+#[test]
+fn completion_scripts_are_generated() {
+    let f = Fixture::new("completion");
+
+    let bash = f.stdout(&["completion", "bash"]);
+    assert!(bash.contains("complete -F _rpf rpf"), "{}", bash);
+    assert!(bash.contains("provides"), "{}", bash);
+    // The script must be valid shell.
+    let script = f.path("rpf.bash");
+    fs::write(&script, &bash).unwrap();
+    let status = Command::new("bash").arg("-n").arg(&script).status().unwrap();
+    assert!(status.success(), "generated bash completion does not parse");
+
+    let zsh = f.stdout(&["completion", "zsh"]);
+    assert!(zsh.starts_with("#compdef rpf"), "{}", zsh);
+    assert!(zsh.contains("_arguments"), "{}", zsh);
+
+    let fish = f.stdout(&["completion", "fish"]);
+    assert!(fish.contains("__fish_use_subcommand"), "{}", fish);
+    assert!(fish.contains("-l refresh"), "{}", fish);
+
+    // An unknown shell is an error, not silence.
+    let out = f.rpf(&["completion", "tcsh"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unsupported shell"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn download_resolves_dependencies_and_verifies_checksums() {
     let f = Fixture::new("download");

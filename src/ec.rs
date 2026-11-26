@@ -491,7 +491,7 @@ impl Curve {
         let (x, y) = self.affine(p).expect("a curve point cannot be infinity here");
         let mut bytes = y;
         bytes.reverse();
-        bytes[0] |= ((x[x.len() - 1] & 1) as u8) << 7;
+        bytes[0] |= (x[x.len() - 1] & 1) << 7;
         bytes
     }
 

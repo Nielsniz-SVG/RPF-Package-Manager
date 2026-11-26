@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "RPF — a fast, secure RPM package manager for Fedora, written entirely in Rust"
 license = "Apache-2.0 OR MIT"
-rust-version = "1.70"
+rust-version = "1.75"
 repository = "https://github.com/Nielsniz-SVG/RPF-Package-Manager"
 readme = "README.md"
 

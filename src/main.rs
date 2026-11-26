@@ -40,6 +40,7 @@ Verification:
 
 Maintenance:
   makecache                  Download repository metadata
+  completion SHELL           Print a completion script (bash, zsh, fish)
   clean [--all|--metadata|--packages]
   check                      Verify the installed database
 
@@ -132,6 +133,7 @@ fn run(argv: &[String]) -> Result<i32> {
         "remove" | "erase" => cmd_remove(&args),
         "copr" => cmd_copr(&args),
         "clean" => cmd_clean(&args),
+        "completion" | "completions" => cmd_completion(&args),
         "check" => cmd_check(&args),
         other => Err(Error::new(format!(
             "unknown command '{}'\nRun 'rpf --help' for usage.",
@@ -557,6 +559,145 @@ fn owns_from_filelists(
     }
 }
 
+/// Commands, with the one-line description used in completion menus.
+const COMMANDS: &[(&str, &str)] = &[
+    ("list", "List packages"),
+    ("search", "Search names and summaries"),
+    ("info", "Show detailed package information"),
+    ("provides", "Find packages providing a file or capability"),
+    ("repolist", "Show configured repositories"),
+    ("repoquery", "Query available packages"),
+    ("install", "Resolve, download and install packages"),
+    ("download", "Resolve and download packages into the cache"),
+    ("remove", "Remove installed packages"),
+    ("copr", "Enable, remove or list COPR repositories"),
+    ("verify", "Check package signatures"),
+    ("makecache", "Download repository metadata"),
+    ("clean", "Remove cached data"),
+    ("check", "Verify the installed database"),
+    ("completion", "Print a shell completion script"),
+];
+
+/// Global options, shared by the generated scripts.
+const OPTIONS: &[(&str, &str)] = &[
+    ("-y", "Answer yes to all questions"),
+    ("--assumeyes", "Answer yes to all questions"),
+    ("-C", "Use only cached metadata"),
+    ("--cacheonly", "Use only cached metadata"),
+    ("--refresh", "Force a metadata refresh"),
+    ("--releasever", "Override $releasever"),
+    ("--installroot", "Operate on an alternative root"),
+    ("--setopt", "Override a configuration option"),
+    ("--enablerepo", "Enable a repository"),
+    ("--disablerepo", "Disable a repository"),
+    ("--repo", "Limit operations to a repository"),
+    ("--nogpgcheck", "Skip GPG signature checks"),
+    ("--test", "Plan the transaction without touching the system"),
+    ("--noscripts", "Do not run any package scriptlets"),
+    ("--replacefiles", "Allow packages to overwrite conflicting files"),
+    ("--nodeps", "Do not resolve dependencies"),
+    ("--key", "Trust the OpenPGP key in FILE"),
+    ("-q", "Reduce output"),
+    ("--quiet", "Reduce output"),
+    ("-v", "More output"),
+    ("--verbose", "More output"),
+    ("-h", "Show help"),
+    ("--help", "Show help"),
+    ("-V", "Show the version"),
+    ("--version", "Show the version"),
+];
+
+fn words(list: &[(&str, &str)]) -> String {
+    list.iter().map(|(word, _)| *word).collect::<Vec<_>>().join(" ")
+}
+
+fn cmd_completion(args: &Args) -> Result<i32> {
+    let shell = match args.rest.first().map(|s| s.as_str()) {
+        Some(shell) => shell,
+        None => {
+            return Err(Error::new(
+                "completion requires a shell name (bash, zsh or fish)",
+            ))
+        }
+    };
+
+    match shell {
+        "bash" => {
+            println!(
+                "# bash completion for rpf — install with:\n\
+                 #   rpf completion bash | sudo tee /etc/bash_completion.d/rpf\n\
+                 _rpf() {{\n\
+                 \x20   local cur\n\
+                 \x20   cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n\
+                 \x20   local commands=\"{commands}\"\n\
+                 \x20   local options=\"{options}\"\n\
+                 \x20   if [ \"$COMP_CWORD\" -eq 1 ]; then\n\
+                 \x20       COMPREPLY=( $(compgen -W \"${{commands}} ${{options}}\" -- \"$cur\") )\n\
+                 \x20   elif [ \"${{COMP_WORDS[1]}}\" = \"completion\" ]; then\n\
+                 \x20       COMPREPLY=( $(compgen -W \"bash zsh fish\" -- \"$cur\") )\n\
+                 \x20   elif [ \"${{COMP_WORDS[1]}}\" = \"clean\" ]; then\n\
+                 \x20       COMPREPLY=( $(compgen -W \"--all --metadata --packages ${{options}}\" -- \"$cur\") )\n\
+                 \x20   elif [ \"${{COMP_WORDS[1]}}\" = \"list\" ]; then\n\
+                 \x20       COMPREPLY=( $(compgen -W \"--installed --available --all ${{options}}\" -- \"$cur\") )\n\
+                 \x20   else\n\
+                 \x20       COMPREPLY=( $(compgen -W \"${{options}}\" -- \"$cur\") )\n\
+                 \x20   fi\n\
+                 }}\n\
+                 complete -F _rpf rpf",
+                commands = words(COMMANDS),
+                options = words(OPTIONS),
+            );
+        }
+        "zsh" => {
+            println!("#compdef rpf");
+            println!("_rpf() {{");
+            println!("  local -a commands");
+            println!("  commands=(");
+            for (name, description) in COMMANDS {
+                println!("    '{}:{}'", name, description);
+            }
+            println!("  )");
+            println!("  _arguments -C \\");
+            println!("    '(-h --help)'{{-h,--help}}'[Show help]' \\");
+            println!("    '(-V --version)'{{-V,--version}}'[Show the version]' \\");
+            println!("    '-y[Answer yes to all questions]' \\");
+            println!("    '--refresh[Force a metadata refresh]' \\");
+            println!("    '--repo=[Limit operations to a repository]:repo:' \\");
+            println!("    '--installroot=[Operate on an alternative root]:path:_files -/' \\");
+            println!("    '1:command:->command' '*::arg:->args'");
+            println!("  case $state in");
+            println!("    command) _describe 'command' commands ;;");
+            println!("    *) _files ;;");
+            println!("  esac");
+            println!("}}");
+            println!("_rpf \"$@\"");
+        }
+        "fish" => {
+            for (name, description) in COMMANDS {
+                println!(
+                    "complete -c rpf -n '__fish_use_subcommand' -f -a {} -d '{}'",
+                    name, description
+                );
+            }
+            for (option, description) in OPTIONS {
+                let flag = if option.starts_with("--") {
+                    format!("-l {}", &option[2..])
+                } else {
+                    format!("-s {}", &option[1..])
+                };
+                println!("complete -c rpf -f {} -d '{}'", flag, description);
+            }
+        }
+        other => {
+            return Err(Error::new(format!(
+                "unsupported shell '{}' (bash, zsh and fish are supported)",
+                other
+            )))
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_repoquery(args: &Args) -> Result<i32> {
     if args.rest.is_empty() {
         return Err(Error::new("repoquery requires a pattern"));
@@ -588,12 +729,16 @@ fn cmd_download(args: &Args) -> Result<i32> {
     let dir = config.conf.cachedir.join("packages");
     std::fs::create_dir_all(&dir).map_err(|e| Error::new(format!("{}: {}", dir.display(), e)))?;
 
+    let mut remote: Vec<&Package> = Vec::new();
     for pkg in &resolution.install {
         if pkg.repo == "@commandline" {
             println!("  {} (local file, not downloaded)", pkg.location);
             continue;
         }
-        let path = download_package(&config, pkg, &dir)?;
+        remote.push(pkg);
+    }
+    let paths = download_packages(&config, &remote, &dir)?;
+    for path in paths {
         println!("  {}", path.display());
     }
     Ok(0)
@@ -681,12 +826,14 @@ fn cmd_install(args: &Args) -> Result<i32> {
     if !args.quiet && resolution.install.iter().any(|p| !local.contains_key(&p.nevra())) {
         println!("\nDownloading packages:");
     }
-    for pkg in &resolution.install {
-        if local.contains_key(&pkg.nevra()) {
-            continue;
-        }
-        download_package(&config, pkg, &dir)?;
-        if !args.quiet {
+    let to_fetch: Vec<&Package> = resolution
+        .install
+        .iter()
+        .filter(|pkg| !local.contains_key(&pkg.nevra()))
+        .collect();
+    download_packages(&config, &to_fetch, &dir)?;
+    if !args.quiet {
+        for pkg in &to_fetch {
             println!("  {}  ({})", pkg.nevra(), human_size(pkg.download_size));
         }
     }
@@ -1115,6 +1262,64 @@ impl SizeExt for Package {
 }
 
 /// Download one package, verifying its checksum against repository metadata.
+/// Download a batch of packages, up to `max_parallel_downloads` at a time.
+///
+/// Results keep the order of `packages` so callers can print them
+/// deterministically, and the first failure (in that order) is the one
+/// reported.
+fn download_packages(config: &Config, packages: &[&Package], dir: &Path) -> Result<Vec<PathBuf>> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let workers = config
+        .conf
+        .max_parallel_downloads
+        .max(1)
+        .min(packages.len());
+    if workers == 1 {
+        return packages
+            .iter()
+            .map(|pkg| download_package(config, pkg, dir))
+            .collect();
+    }
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<std::sync::Mutex<Option<Result<PathBuf>>>> =
+        (0..packages.len()).map(|_| std::sync::Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failed.load(Ordering::SeqCst) {
+                    break;
+                }
+                let index = next.fetch_add(1, Ordering::SeqCst);
+                if index >= packages.len() {
+                    break;
+                }
+                let result = download_package(config, packages[index], dir);
+                if result.is_err() {
+                    failed.store(true, Ordering::SeqCst);
+                }
+                *slots[index].lock().unwrap() = Some(result);
+            });
+        }
+    });
+
+    let mut out = Vec::with_capacity(packages.len());
+    for slot in slots {
+        match slot.into_inner().unwrap() {
+            Some(Ok(path)) => out.push(path),
+            Some(Err(e)) => return Err(e),
+            None => return Err(Error::new("a download worker did not report a result")),
+        }
+    }
+    Ok(out)
+}
+
 fn download_package(config: &Config, pkg: &Package, dir: &Path) -> Result<PathBuf> {
     let dest = dir.join(pkg.filename());
 

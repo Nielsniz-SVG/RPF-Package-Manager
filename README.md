@@ -66,7 +66,8 @@ verification and scriptlets — see the table below and
 | Dependency solver: transitive deps, obsoletes, conflicts, ordering | **Working** |
 | Local binary metadata cache | **Working** |
 | COPR enable / remove / list | **Working** |
-| Package download into the cache | **Working** |
+| Package download into the cache, `max_parallel_downloads` workers | **Working** |
+| Shell completion for bash, zsh and fish (`rpf completion SHELL`) | **Working** |
 | `list`, `search`, `info`, `provides`, `repoquery`, `repolist` | **Working** |
 | RPM header and cpio payload parsing | **Working** |
 | Installing packages to disk (`--installroot` supported) | **Working** |
@@ -101,7 +102,7 @@ the same model `rpm --import` uses.
 
 ```sh
 cargo build --release      # -> target/release/rpf
-cargo test                 # 173 tests: unit, end-to-end, installation
+cargo test                 # 175 tests: unit, end-to-end, installation
 ```
 
 Requirements: a Rust toolchain (1.70+). At runtime on Fedora, RPF uses `curl`
@@ -124,6 +125,7 @@ rpf verify ./some-package.rpm         # check signatures
 rpf verify --key mykey.asc pkg.rpm    # ...against a specific key
 rpf copr enable user/project          # add a COPR repository
 rpf clean all                         # drop caches
+rpf completion bash                   # shell completion for bash/zsh/fish
 ```
 
 Global options include `--releasever`, `--installroot`, `--setopt`,

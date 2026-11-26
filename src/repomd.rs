@@ -657,7 +657,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn parses_filelists() {
         let text = r#"<?xml version="1.0" encoding="UTF-8"?>
 <filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="2">
@@ -709,6 +708,7 @@ mod tests {
         assert!(parse_filelists("<filelists/>").unwrap().is_empty());
     }
 
+    #[test]
     fn parses_primary_packages() {
         let pkgs = parse_primary(PRIMARY, "fedora").unwrap();
         assert_eq!(pkgs.len(), 2);

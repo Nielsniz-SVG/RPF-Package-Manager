@@ -156,7 +156,7 @@ so a hostile id cannot escape the cache directory.
 | **Writing the rpmdb** | Reading is implemented; writing rpm's own database is not, by choice. Installing with RPF therefore does not make a package visible to `rpm -qa` or to dnf. |
 | **`other.xml` (changelogs)** | `primary.xml` and `filelists.xml` are parsed; `other.xml` only carries changelogs, which nothing in RPF displays yet. |
 | **Modules, comps groups, delta RPMs, `--downloadonly` semantics** | Not part of the foundation. |
-| **Parallel downloads** | Downloads are sequential per package. `max_parallel_downloads` is parsed but not yet acted on. |
+| **Progress bars** | Downloads report one line per package once they finish; there is no byte-level progress meter. |
 
 ## Environment note
 
@@ -186,14 +186,15 @@ accident.
 * The real `basic-gzip.rpm` fixture is also installed into a scratch
   `--installroot` and compared file by file.
 
-`cargo test` runs 173 tests: 124 library unit tests, 4 CLI unit tests, 25
-installation tests, 16 end-to-end tests and 4 curve-signature tests. The rpmdb
+`cargo test` runs 175 tests: 124 library unit tests, 4 CLI unit tests, 25
+installation tests, 18 end-to-end tests and 4 curve-signature tests. The rpmdb
 tests run against a stand-in `rpm` executable that emits genuine `--xml` output,
 so the parsing and the fallback paths are exercised without rpm being installed.
 
 ## Next steps
 
-1. **Polish** — parallel downloads, progress output, shell completion.
+1. **Polish** — byte-level progress output, GPG key expiry and revocation,
+   `other.xml` changelogs.
 
 Phase 2 (feature parity and beyond) starts once 1 is done and the
 foundation installs, upgrades and removes packages cleanly on a real Fedora
