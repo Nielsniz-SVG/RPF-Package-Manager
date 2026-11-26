@@ -144,7 +144,16 @@ pub fn install(
             continue;
         }
 
-        run_script(rpm.scriptlets().prein.as_deref(), pkg, opts, &mut report, "%pre", 1);
+        let scriptlets = rpm.scriptlets();
+    run_script(
+        scriptlets.prein.as_deref(),
+        scriptlets.prein_prog.as_deref(),
+        pkg,
+        opts,
+        &mut report,
+        "%pre",
+        1,
+    );
 
         // Pass 2: extract.
         let mut reader = CpioReader::new(&payload);
@@ -293,7 +302,15 @@ pub fn install(
             }
         }
 
-        run_script(rpm.scriptlets().postin.as_deref(), pkg, opts, &mut report, "%post", 1);
+        run_script(
+        scriptlets.postin.as_deref(),
+        scriptlets.postin_prog.as_deref(),
+        pkg,
+        opts,
+        &mut report,
+        "%post",
+        1,
+    );
 
         // Record the whole header file list, including ghosts and configs, so
         // that removal can clean up correctly.
@@ -378,6 +395,7 @@ pub fn remove(config: &Config, names: &[String], opts: &Options) -> Result<Repor
         let scriptlets = installed_scriptlets(config, &pkg);
         run_script(
             scriptlets.as_ref().and_then(|s| s.preun.as_deref()),
+            scriptlets.as_ref().and_then(|s| s.preun_prog.as_deref()),
             &pkg,
             opts,
             &mut report,
@@ -435,6 +453,7 @@ pub fn remove(config: &Config, names: &[String], opts: &Options) -> Result<Repor
 
         run_script(
             scriptlets.as_ref().and_then(|s| s.postun.as_deref()),
+            scriptlets.as_ref().and_then(|s| s.postun_prog.as_deref()),
             &pkg,
             opts,
             &mut report,
@@ -535,6 +554,7 @@ fn apply_ownership(installroot: &Path, path: &Path, meta: Option<&RpmFile>) -> R
 
 fn run_script(
     script: Option<&str>,
+    prog: Option<&str>,
     pkg: &Package,
     opts: &Options,
     report: &mut Report,
@@ -557,21 +577,45 @@ fn run_script(
         return;
     }
 
-    // rpm invokes scriptlets as `sh -c <script> <pkg> <n>`, so `$1` is the
-    // number of instances of the package that will exist after this step and
-    // `$0` is the package name.
+    let interpreter = prog.unwrap_or("/bin/sh");
+    if rpm::Scriptlets::is_embedded(interpreter) {
+        report.warnings.push(format!(
+            "{}: {} scriptlet not run (embedded interpreter {} is not supported)",
+            pkg.nevra(),
+            kind,
+            interpreter
+        ));
+        return;
+    }
+
+    // rpm invokes shell scriptlets as `sh -c <script> <pkg> <n>`, so `$1` is
+    // the number of instances of the package that will exist after this step
+    // and `$0` is the package name. A non-shell interpreter (`%post -p
+    // /sbin/ldconfig`) receives the body as its arguments instead.
+    let shell_like = interpreter.ends_with("sh");
     let mut cmd = if opts.installroot == Path::new("/") {
-        let mut c = std::process::Command::new("/bin/sh");
-        c.arg("-c").arg(script).arg(&pkg.name).arg(argument.to_string());
+        let mut c = std::process::Command::new(interpreter);
+        if shell_like {
+            c.arg("-c").arg(script).arg(&pkg.name).arg(argument.to_string());
+        } else if !script.trim().is_empty() {
+            c.arg(script);
+        }
         c
     } else {
         // Inside a chroot the script sees only the target root's filesystem.
-        let inner = format!(
-            "/bin/sh -c {} {} {}",
-            shell_quote(script),
-            shell_quote(&pkg.name),
-            argument
-        );
+        let inner = if shell_like {
+            format!(
+                "{} -c {} {} {}",
+                shell_quote(interpreter),
+                shell_quote(script),
+                shell_quote(&pkg.name),
+                argument
+            )
+        } else if script.trim().is_empty() {
+            shell_quote(interpreter)
+        } else {
+            format!("{} {}", shell_quote(interpreter), shell_quote(script))
+        };
         let mut c = std::process::Command::new("chroot");
         c.arg(&opts.installroot).arg("/bin/sh").arg("-c").arg(inner);
         c

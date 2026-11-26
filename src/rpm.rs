@@ -487,12 +487,20 @@ impl<'a> CpioReader<'a> {
 }
 
 /// Scriptlets carried by a package.
+///
+/// `prein_prog` and friends are the interpreter the scriptlet asks for. rpm
+/// defaults to `/bin/sh`, but packages may specify others, most commonly
+/// `%post -p /sbin/ldconfig` with an empty body.
 #[derive(Debug, Clone, Default)]
 pub struct Scriptlets {
     pub prein: Option<String>,
     pub postin: Option<String>,
     pub preun: Option<String>,
     pub postun: Option<String>,
+    pub prein_prog: Option<String>,
+    pub postin_prog: Option<String>,
+    pub preun_prog: Option<String>,
+    pub postun_prog: Option<String>,
 }
 
 impl Scriptlets {
@@ -501,6 +509,16 @@ impl Scriptlets {
             && self.postin.is_none()
             && self.preun.is_none()
             && self.postun.is_none()
+    }
+
+    /// The interpreter rpm would use; `/bin/sh` when the package does not say.
+    pub fn interpreter(prog: &Option<String>) -> String {
+        prog.clone().unwrap_or_else(|| "/bin/sh".to_string())
+    }
+
+    /// Embedded interpreters (`%post -p <lua>`) cannot be run by RPF.
+    pub fn is_embedded(prog: &str) -> bool {
+        prog.starts_with('<') && prog.ends_with('>')
     }
 }
 
@@ -704,6 +722,10 @@ impl Rpm {
             postin: self.header.string(tag::POSTIN),
             preun: self.header.string(tag::PREUN),
             postun: self.header.string(tag::POSTUN),
+            prein_prog: self.header.string(tag::PREINPROG),
+            postin_prog: self.header.string(tag::POSTINPROG),
+            preun_prog: self.header.string(tag::PREUNPROG),
+            postun_prog: self.header.string(tag::POSTUNPROG),
         }
     }
 
@@ -1268,6 +1290,21 @@ mod tests {
             "expected a parsed rich dependency: {:?}",
             all.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn scriptlets_report_their_interpreter() {
+        let rpm = Rpm::open(&fixture("scriptlets.rpm")).unwrap();
+        let scriptlets = rpm.scriptlets();
+        // rpm defaults to /bin/sh when the package does not name an interpreter.
+        assert_eq!(
+            Scriptlets::interpreter(&scriptlets.postin_prog),
+            "/bin/sh"
+        );
+        assert!(Scriptlets::is_embedded("<lua>"));
+        assert!(Scriptlets::is_embedded("<lua:5.4>"));
+        assert!(!Scriptlets::is_embedded("/sbin/ldconfig"));
+        assert!(!Scriptlets::is_embedded("/usr/bin/python3"));
     }
 
     #[test]

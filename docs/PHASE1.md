@@ -138,7 +138,7 @@ so a hostile id cannot escape the cache directory.
 
 | Area | Why it is deferred |
 |---|---|
-| **Scriptlet macro expansion** | `%pre`/`%post`/`%preun`/`%postun` are executed through `/bin/sh` (through `chroot` for an `--installroot`) and receive rpm's `$1` argument. Bodies that contain `%{...}` macros are not expanded yet, and scriptlets are skipped with a warning when RPF is not root. |
+| **Embedded scriptlet interpreters** | `%pre`/`%post`/`%preun`/`%postun` run through the interpreter the package names (`%post -p /sbin/ldconfig` works), inside `chroot` for an `--installroot`, with rpm's `$1` argument. Embedded interpreters such as `<lua>` are reported and skipped: RPF has no Lua. |
 | **EdDSA / ECDSA signatures** | RSA is what Fedora signs with, so RSA was implemented first. Ed25519 and ECDSA keys are detected, reported as unsupported and refused — never silently accepted. |
 | **Key trust model** | Expiry, revocation and web-of-trust are not evaluated. A key in the keyring is trusted, which matches `rpm --import`. |
 | **Writing the rpmdb** | Reading is implemented; writing rpm's own database is not, by choice. Installing with RPF therefore does not make a package visible to `rpm -qa` or to dnf. |
@@ -174,19 +174,18 @@ accident.
 * The real `basic-gzip.rpm` fixture is also installed into a scratch
   `--installroot` and compared file by file.
 
-`cargo test` runs 161 tests: 117 library unit tests, 4 CLI unit tests, 25
+`cargo test` runs 162 tests: 118 library unit tests, 4 CLI unit tests, 25
 installation tests and 15 end-to-end tests. The rpmdb tests run against a
 stand-in `rpm` executable that emits genuine `--xml` output, so the parsing and
 the fallback paths are exercised without rpm being installed.
 
 ## Next steps
 
-1. **Scriptlet macro expansion** — `%{_bindir}` and friends.
-2. **EdDSA/ECDSA verification** — needed only if a repository we must support
+1. **EdDSA/ECDSA verification** — needed only if a repository we must support
    signs with those algorithms.
-3. **`filelists.xml`** — so file queries work for files that are not in
+2. **`filelists.xml`** — so file queries work for files that are not in
    `primary.xml`.
-4. **Polish** — parallel downloads, progress output, shell completion.
+3. **Polish** — parallel downloads, progress output, shell completion.
 
 Phase 2 (feature parity and beyond) starts only once 1–3 are done and the
 foundation installs, upgrades and removes packages cleanly on a real Fedora

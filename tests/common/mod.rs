@@ -268,6 +268,8 @@ pub struct PkgSpec {
     pub compress: bool,
     /// Emit a scriptlet into %post that touches this path (needs root to run).
     pub post_script: Option<String>,
+    /// Interpreter for that scriptlet, e.g. "/sbin/ldconfig".
+    pub post_script_prog: Option<String>,
 }
 
 impl PkgSpec {
@@ -285,6 +287,7 @@ impl PkgSpec {
             requires: Vec::new(),
             compress: false,
             post_script: None,
+            post_script_prog: None,
         }
     }
 
@@ -431,6 +434,9 @@ pub fn build_rpm(spec: &PkgSpec) -> Vec<u8> {
     }
     if let Some(script) = &spec.post_script {
         h = h.string(1024, script);
+    }
+    if let Some(prog) = &spec.post_script_prog {
+        h = h.string(1086, prog);
     }
 
     // Dependency tags: names/flags/versions triples.
